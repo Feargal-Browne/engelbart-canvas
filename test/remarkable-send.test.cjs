@@ -110,10 +110,13 @@ test('a name of only dots or spaces is sent under a dated name, not "Untitled"',
   assert.equal(result.name, 'From Engelbart 2026-10-31 12.30');
 });
 
-test('the sync is told before the app is given the PDF, and which document its copy became', async () => {
+test('the sync is told before the app is given the PDF, from which library row, and which document its copy became', async () => {
   const app = fakeApp();
   const told = [];
-  const send = createRemarkableSend({ ...app.deps, dir: tmp(), now: clock(), expect: (name) => told.push(['expect', name, app.opened.length]), arrived: (e) => told.push(['arrived', e.id, e.name]) });
-  await send.send({ name: 'Paper', bytes: PDF });
-  assert.deepEqual(told, [['expect', 'Paper', 0], ['arrived', 'new-1', 'Paper']]);
+  const send = createRemarkableSend({ ...app.deps, dir: tmp(), now: clock(), expect: (name, row) => told.push(['expect', name, row, app.opened.length]), arrived: (e) => told.push(['arrived', e.id, e.name]) });
+  await send.send({ name: 'Paper', bytes: PDF, from: 'row-1' });
+  assert.deepEqual(told, [['expect', 'Paper', 'row-1', 0], ['arrived', 'new-1', 'Paper']]);
+  told.length = 0;
+  await send.send({ name: 'Loose', bytes: PDF });
+  assert.equal(told[0][2], null, 'a PDF the library does not hold is from no row');
 });

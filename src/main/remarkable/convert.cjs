@@ -59,15 +59,17 @@ function cloneAtomic(from, file) {
 }
 
 /**
- * `{ dir, id, pdf, md, handwriting, cacheDir, unlessUntouched }`: the library folder, the document, the absolute paths
+ * `{ dir, id, pdf, md, handwriting, cacheDir, unlessUntouched, order }`: the library folder, the document, the absolute paths
  * to write (`pdf` null for an ebook), and how to read its handwriting: 'all' (what the cache in `cacheDir` lacks is read now),
  * 'cached' (only what the cache has: a sync's first pass, so documents come in fast), or false. `deps.recognize`
  * replaces the Mac's reading (the tests); `deps.signal` stops a reading under way (it rejects, code 'aborted': what
  * was read stays in the cache). `unlessUntouched`: a PDF nobody has written on is not written at all, and its files from
- * before go (a copy sent from Engelbart: ./send.cjs). → { pdf, md: written?, pages, untouched, handwriting: { pages,
- * unread, supported } }. A `.md` with nothing to say is removed rather than left stale.
+ * before go (a copy sent from Engelbart: ./send.cjs). `order`: 'source' keeps a PDF's pages in its own order, with pages
+ * inserted on the tablet after them (bridge documentToPdf), for a copy whose ink goes onto the library row it was sent
+ * from, where Engelbart's highlights are kept by page number. → { pdf, md: written?, pages, untouched, handwriting: {
+ * pages, unread, supported } }. A `.md` with nothing to say is removed rather than left stale.
  */
-async function convertDocument({ dir, id, pdf, md, handwriting = false, cacheDir = null, unlessUntouched = false }, deps = {}) {
+async function convertDocument({ dir, id, pdf, md, handwriting = false, cacheDir = null, unlessUntouched = false, order = 'tablet' }, deps = {}) {
   const bridge = require('remarkable-bridge');
   const source = bridge.createFolderSource(dir);
   const bundle = await source.open(id);
@@ -89,7 +91,7 @@ async function convertDocument({ dir, id, pdf, md, handwriting = false, cacheDir
     cloneAtomic(original, pdf);
     wrotePdf = true;
   } else if (pdf && bundle.content.fileType !== 'epub') {
-    writeAtomic(pdf, await bridge.documentToPdf(doc, { source: await bundle.source(), handwriting: read.handwriting }));
+    writeAtomic(pdf, await bridge.documentToPdf(doc, { source: await bundle.source(), handwriting: read.handwriting, order: order === 'source' ? 'source' : 'tablet' }));
     wrotePdf = true;
   }
   const text = bridge.documentMarkdown(doc, { handwriting: read.handwriting });

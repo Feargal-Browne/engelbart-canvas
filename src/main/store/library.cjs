@@ -102,6 +102,20 @@ async function writeAnnotations(ctx, id, value) {
   return inkInTurn(() => writeJson(annotationFile(ctx, id), value));
 }
 
+/**
+ * The ink a row reads from elsewhere (filed by its file or address before the library held it: readAnnotations) made
+ * its own, so it stays with the row when the row's file changes (a sent PDF's tablet ink: remarkable/rows.cjs).
+ * → whether it was written.
+ */
+async function keepAnnotations(ctx, id) {
+  return inkInTurn(async () => {
+    const own = annotationFile(ctx, id);
+    if (fs.existsSync(own)) return false;
+    const held = await readAnnotations(ctx, id);
+    return held ? writeJson(own, held) : false;
+  });
+}
+
 // Ink on a pdf read in the Browser pane (2026-09-22), and on a web page (MATH-54). With the library's row when the
 // library holds it (a file, or an address it knows: the Paper pane shows the same ink), else kept by the address the
 // library would give it, so a row added later finds it (readAnnotations).
@@ -1121,4 +1135,4 @@ async function previewItem(ctx, id, { listRemoteFiles } = {}) {
   return out;
 }
 
-module.exports = { seedIfEmpty, listLibrary, readLibraryFile, readAnnotations, writeAnnotations, readPageAnnotations, annotationsFileOf, writePageAnnotations, addMarkAnswer, addWebMark, updateWebMark, readWebMark, removeWebMark, restoreWebMark, cropFile, projectsForLibraryItem, libraryForProject, bodiesForProject, bodiesForLibrary, MAX_BODY_CHARS, canonicalRemote, readCloneRemote, resolveAddition, addressTags, addItem, addPdfCopy, addPageCopy, addMarkdownCopy, isPdfBytes, writePdfCopy, MAX_PDF_BYTES, addFileCopy, addFromUrl, imageMimeOf, MAX_IMAGE_BYTES, lookupItem, recategorize, CATEGORY_RULES, previewItem, FILE_TYPES, PEEK_SKIP };
+module.exports = { seedIfEmpty, listLibrary, readLibraryFile, readAnnotations, writeAnnotations, keepAnnotations, readPageAnnotations, annotationsFileOf, writePageAnnotations, addMarkAnswer, addWebMark, updateWebMark, readWebMark, removeWebMark, restoreWebMark, cropFile, projectsForLibraryItem, libraryForProject, bodiesForProject, bodiesForLibrary, MAX_BODY_CHARS, canonicalRemote, readCloneRemote, resolveAddition, addressTags, addItem, addPdfCopy, addPageCopy, addMarkdownCopy, isPdfBytes, writePdfCopy, MAX_PDF_BYTES, addFileCopy, addFromUrl, imageMimeOf, MAX_IMAGE_BYTES, lookupItem, recategorize, CATEGORY_RULES, previewItem, FILE_TYPES, PEEK_SKIP };

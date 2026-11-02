@@ -3,7 +3,8 @@
 // A PDF or EPUB-from-PDF document: its own pages, in the tablet's order (pages moved, inserted or deleted on the tablet
 // moved, inserted or left out here), each with its ink and highlights over it at the tablet's fixed scale
 // (../geometry.ts). When the pages are the PDF's own in their own order, which is nearly always, the PDF is written on
-// in place, so its links, outline and text stay as they were.
+// in place, so its links, outline and text stay as they were. With `order: 'source'` the PDF's pages stay in their own
+// order and keep their numbers (pages inserted on the tablet come after them), for a PDF marked elsewhere by page.
 //
 // A notebook: one PDF page per tablet page, the page's own size at 227 units to the point (445×594 pt for a reMarkable
 // 2, 514×685 for a Paper Pro), longer when the ink runs further down. Typed text is set in Helvetica, so it is real,
@@ -33,6 +34,12 @@ export interface PdfOptions {
   handwriting?: Handwriting;
   /** The paper's colour, for eraser strokes on older pages. Default white. */
   paper?: Rgba;
+  /**
+   * A PDF document's page order. 'tablet' (the default): the tablet's, as above. 'source': the PDF's own pages in their
+   * own order, each with the ink of the tablet page that shows it, then the pages inserted on the tablet. Every PDF
+   * page keeps its number, so marks made on the same PDF elsewhere, kept by page number, still land on their page.
+   */
+  order?: 'tablet' | 'source';
 }
 
 const WHITE: Rgba = { r: 255, g: 255, b: 255, a: 1 };
@@ -49,8 +56,9 @@ export async function documentToPdf(doc: ReadDocument, options: PdfOptions = {})
       doc.pages.forEach(({ ref, page }, i) => { if (page) drawOnPdfPage(source, pages[i]!, page, font, paper, options.handwriting?.get(ref.id)); });
       return source.save();
     }
-    const out = await PDFDocument.create();
     const onPdf = (n: number | null): n is number => n !== null && Number.isInteger(n) && n >= 0 && n < count;
+    if (options.order === 'source') return inSourceOrder(source, doc, onPdf, paper, options.handwriting);
+    const out = await PDFDocument.create();
     const wanted = doc.pages.map(({ ref }) => ref.sourcePage).filter(onPdf);
     const copied = await out.copyPages(source, wanted);
     const font = await fontFor(out, doc.pages, options.handwriting);
@@ -84,6 +92,40 @@ export async function documentToPdf(doc: ReadDocument, options: PdfOptions = {})
     draw(out, pdfPage, page, pdfMapping({ x0: 0, y0: 0, x1: W, y1: H }), font, paper, options.handwriting?.get(ref.id));
   }
   return out.save();
+}
+
+/**
+ * order 'source': the PDF written on in place, every page where it was. A page the tablet shows is drawn on with that
+ * page's ink (a page shown twice: its first showing, and a copy of it with the second after the PDF's pages); one
+ * deleted on the tablet stays, with no ink; one inserted on the tablet comes after the PDF's pages, in the tablet's
+ * order, the size of the page before it there.
+ */
+async function inSourceOrder(source: PDFDocument, doc: ReadDocument, onPdf: (n: number | null) => n is number, paper: Rgba, handwriting?: Handwriting): Promise<Uint8Array> {
+  const pages = source.getPages();
+  // Second showings copied first, before any page has ink on it.
+  const seen = new Set<number>();
+  const again = doc.pages.map(({ ref }) => (onPdf(ref.sourcePage) && (seen.has(ref.sourcePage) || !seen.add(ref.sourcePage)) ? ref.sourcePage : null));
+  const copies = await source.copyPages(source, again.filter((n): n is number => n !== null));
+  const font = await fontFor(source, doc.pages, handwriting);
+  let next = 0;
+  let lastSize: [number, number] = [RM2_PAGE.width / UNITS_PER_POINT, RM2_PAGE.height / UNITS_PER_POINT];
+  for (const [i, { ref, page }] of doc.pages.entries()) {
+    let pdfPage: PDFPage;
+    if (onPdf(ref.sourcePage)) {
+      const own = pages[ref.sourcePage]!;
+      const box = own.getCropBox();
+      lastSize = [box.width, box.height];
+      if (again[i] === null) {
+        if (page) drawOnPdfPage(source, own, page, font, paper, handwriting?.get(ref.id));
+        continue;
+      }
+      pdfPage = source.addPage(copies[next++]!);
+    } else {
+      pdfPage = source.addPage(lastSize);
+    }
+    if (page) drawOnPdfPage(source, pdfPage, page, font, paper, handwriting?.get(ref.id));
+  }
+  return source.save();
 }
 
 /** The PDF, or null when pdf-lib cannot open it (encrypted, damaged): its ink then goes on blank pages. */

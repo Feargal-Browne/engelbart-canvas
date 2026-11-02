@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { PDFDocument, StandardFonts } from 'pdf-lib';
+import { PDFArray, PDFDocument, StandardFonts } from 'pdf-lib';
 import { openBundle } from '../src/doc/bundle.ts';
 import { readDocument } from '../src/document.ts';
 import { documentToPdf } from '../src/export/pdf.ts';
@@ -67,6 +67,27 @@ test('pages moved and inserted on the tablet come out in the tablet order', asyn
   const bundle = await bundleOf(source, pages, [P[1]!]);
   const pdf = await PDFDocument.load(await documentToPdf(await readDocument(bundle), { source: await bundle.source() }));
   assert.deepEqual(pdf.getPages().map((p) => [p.getWidth(), p.getHeight()]), [[400, 600], [400, 600], [600, 800]]);
+});
+
+test('order source: the PDF’s pages keep their numbers, with their ink; inserted pages come after', async () => {
+  // Tablet order as above: PDF page 3 (inked), an inserted page (inked), PDF page 1; page 2 deleted on the tablet.
+  const source = await pdfOf([[600, 800], [500, 700], [400, 600]]);
+  const pages = [
+    { id: P[0], idx: lww('ba'), redir: lww(2) },
+    { id: P[1], idx: lww('bb') },
+    { id: P[2], idx: lww('bc'), redir: lww(0) },
+    { id: '44444444-4444-4444-8444-444444444444', idx: lww('bd'), redir: lww(1), deleted: lww(1) },
+  ];
+  const bundle = await bundleOf(source, pages, [P[0]!, P[1]!]);
+  const doc = await readDocument(bundle);
+  const pdf = await PDFDocument.load(await documentToPdf(doc, { source: await bundle.source(), order: 'source' }));
+  assert.deepEqual(pdf.getPages().map((p) => [p.getWidth(), p.getHeight()]), [[600, 800], [500, 700], [400, 600], [400, 600]],
+    'pages 1–3 where they were (page 2 too), then the inserted page, the size of the one before it on the tablet');
+  const plain = await PDFDocument.load(source);
+  const streams = (d: PDFDocument, i: number) => { const c = d.getPage(i).node.Contents(); return c instanceof PDFArray ? c.size() : c ? 1 : 0; };
+  assert.ok(streams(pdf, 2) > streams(plain, 2), 'page 3 has its ink drawn on');
+  assert.equal(streams(pdf, 1), streams(plain, 1), 'page 2, deleted on the tablet, is as it was');
+  assert.ok(streams(pdf, 3) > 0, 'the inserted page has its ink');
 });
 
 test('a PDF that cannot be opened still gives the ink, on blank pages', async () => {

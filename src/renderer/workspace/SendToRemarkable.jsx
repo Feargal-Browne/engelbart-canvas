@@ -4,20 +4,21 @@ import { api, errorMessage } from '../api.js';
 // Send to reMarkable (2026-10-31, src/main/remarkable/send.cjs): the PDF open in the Stage handed to the reMarkable app,
 // which imports it and syncs it to the tablet. From the Stage's ⋮ menu; the card says what came of it: in the
 // reMarkable app; handed over (its library could not be read to tell); or, when the app did not take it by itself, the
-// file to drag into the app's window (reMarkable's own way), then in the app once it shows in its library.
+// file to drag into the app's window (reMarkable's own way), then in the app once it shows in its library. `rowId`: the
+// library row the PDF is, so what is written on it on the tablet comes back onto that item (null: not in the library).
 
 const EASE = 'cubic-bezier(0.2, 0, 0, 1)';
 const say = { font: '13px/1.5 var(--font-sans)', color: '#171717', margin: 0, overflowWrap: 'anywhere' };
 const quiet = { ...say, fontSize: 12, color: '#8f8f8f', marginTop: 6 };
 
-export default function SendToRemarkable({ name, bytes, onClose }) {
+export default function SendToRemarkable({ name, bytes, rowId = null, onClose }) {
   const [step, setStep] = React.useState({ state: 'sending' });
   React.useEffect(() => {
     let live = true;
     let waiting = null; // the name main waits for while the card offers the drag: the wait ends when the card closes
     (async () => {
       try {
-        const result = await api.remarkableSend(name, bytes);
+        const result = await api.remarkableSend(name, bytes, rowId || null);
         if (!live) return;
         if (result.error) { setStep({ state: 'error', error: result.error }); return; }
         setStep(result);
@@ -32,7 +33,7 @@ export default function SendToRemarkable({ name, bytes, onClose }) {
       }
     })();
     return () => { live = false; if (waiting) void api.remarkableCancelDrop(waiting).catch(() => {}); };
-  }, [name, bytes]);
+  }, [name, bytes, rowId]);
   const title = `“${step.name || name}”`;
   const chip = step.file && (
     <div

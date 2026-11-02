@@ -17,6 +17,14 @@ import SendToRemarkable from './SendToRemarkable.jsx';
 
 const IS_MAC = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || '');
 
+// A pdf that is the reMarkable's already: a document of the tablet's, or a row whose ink came back from it (its file the
+// reMarkable mirror's, src/main/remarkable/rows.cjs). Send to reMarkable is not offered for it.
+const IN_REMARKABLE = /\/\.remarkable\/library\//;
+const fromRemarkable = (pdf, library) => {
+  const row = pdf.rowId ? (library || []).find((r) => r.id === pdf.rowId) : null;
+  return IN_REMARKABLE.test(String(pdf.input || '')) || IN_REMARKABLE.test(String((row && row.path) || ''));
+};
+
 // The Stage (Claude Design "Add - Mention Stage.dc.html", 2026-09-23): the Browser and the Paper pane made one. A tab
 // shows whatever it was given — a library row, a link, a file on disk — in the way its format asks:
 //  · a page (the web, a local server, an html file) is a WebContentsView in the main process (src/main/browser/
@@ -423,7 +431,7 @@ const Stage = React.forwardRef(function Stage({ projectId, visible, full, onFull
   const [pick, setPick] = React.useState(0); // the row of the address list Enter takes
   const [found, setFound] = React.useState(null); // the library's answer for a typed place: { input, row }
   const [saving, setSaving] = React.useState(false); // the Save card is open
-  const [sendingPdf, setSendingPdf] = React.useState(null); // Send to reMarkable's card: { name, bytes, seq }
+  const [sendingPdf, setSendingPdf] = React.useState(null); // Send to reMarkable's card: { name, bytes, rowId, seq }
   const [finding, setFinding] = React.useState(false); // the find card is open
   const [findText, setFindText] = React.useState('');
   const [matches, setMatches] = React.useState(null); // { matches, active } in the tab in front
@@ -1318,7 +1326,7 @@ const Stage = React.forwardRef(function Stage({ projectId, visible, full, onFull
           <button type="button" className="hov-wash" data-stage-box={boxing === tab.id ? 'on' : 'off'} aria-pressed={boxing === tab.id} onClick={() => quiet(api.browserBox(tab.id))} aria-label="Box part of the page" title="Box part of the page (or hold ⌥ and drag)" style={{ ...ICON_BUTTON, display: 'flex', alignItems: 'center', justifyContent: 'center', background: boxing === tab.id ? '#f2f2f2' : 'transparent', color: boxing === tab.id ? '#0070f3' : '#4d4d4d' }}><BoxGlyph /></button>
         )}
         {saving && saveState === 'none' && <SaveCard key={pageInput} title={pageTitle || stripScheme(pageInput)} onSave={save.onSave} onClose={() => setSaving(false)} cardRef={saveCard} />}
-        {sendingPdf && <SendToRemarkable key={sendingPdf.seq} name={sendingPdf.name} bytes={sendingPdf.bytes} onClose={() => setSendingPdf(null)} />}
+        {sendingPdf && <SendToRemarkable key={sendingPdf.seq} name={sendingPdf.name} bytes={sendingPdf.bytes} rowId={sendingPdf.rowId} onClose={() => setSendingPdf(null)} />}
         <div style={{ position: 'relative' }} ref={menuRef}>
           <button type="button" className="hov-wash" onClick={(event) => { const r = event.currentTarget.getBoundingClientRect(); setMenu(menu ? null : { x: r.right, y: r.bottom }); }} aria-label="More" style={{ ...ICON_BUTTON, background: menu ? '#f2f2f2' : 'transparent', font: '600 16px/1 var(--font-sans)', color: '#4d4d4d' }}>⋮</button>
           {menu && (
@@ -1341,9 +1349,9 @@ const Stage = React.forwardRef(function Stage({ projectId, visible, full, onFull
                   {page && <div className="hov-wash" onClick={() => { quiet(api.browserCommand(tab.id, 'devtools')); setMenu(null); }} style={{ padding: '7px 10px 7px 34px', borderRadius: 6, cursor: 'pointer', font: '13px/1.4 var(--font-sans)', color: '#171717' }}>Developer tools</div>}
                 </div>
               )}
-              {IS_MAC && pdf && pdf.bytes && !/\/\.remarkable\/library\//.test(String(pdf.input || '')) && (
+              {IS_MAC && pdf && pdf.bytes && !fromRemarkable(pdf, library) && (
                 <div style={{ borderTop: '1px solid #eaeaea', marginTop: 4, paddingTop: 4 }}>
-                  <div className="hov-wash" data-stage-send-remarkable="1" onClick={() => { setMenu(null); setSendingPdf({ name: pdf.name, bytes: pdf.bytes, seq: Date.now() }); }} style={{ padding: '7px 10px 7px 34px', borderRadius: 6, cursor: 'pointer', font: '13px/1.4 var(--font-sans)', color: '#171717' }}>Send to reMarkable</div>
+                  <div className="hov-wash" data-stage-send-remarkable="1" onClick={() => { setMenu(null); setSendingPdf({ name: pdf.name, bytes: pdf.bytes, rowId: pdf.rowId || null, seq: Date.now() }); }} style={{ padding: '7px 10px 7px 34px', borderRadius: 6, cursor: 'pointer', font: '13px/1.4 var(--font-sans)', color: '#171717' }}>Send to reMarkable</div>
                 </div>
               )}
               {IS_MAC && (

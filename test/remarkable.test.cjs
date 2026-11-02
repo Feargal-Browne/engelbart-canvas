@@ -201,6 +201,7 @@ function memoryLibrary(rows = []) {
     table,
     libraryDb: {
       list: async () => [...table.values()].map((r) => ({ ...r })),
+      get: async (id) => (table.has(id) ? { ...table.get(id) } : null),
       insert: async (row) => { table.set(row.id, { ...row }); return { ...row }; },
       rename: async (id, name) => { table.get(id).name = name; return { ...table.get(id) }; },
       updatePath: async (id, p) => { table.get(id).path = p; return { ...table.get(id) }; },
@@ -494,4 +495,131 @@ test('a PDF sent from Engelbart stays out of the library until it is written on;
   // Disconnecting keeps which documents were sent from here.
   await remarkable.disconnect();
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(path.join(mirrorDir(dataRoot), 'sent.json'), 'utf8')).ids), ['5e17c0de-0000-4000-8000-000000000001']);
+});
+
+// Annotations merge (2026-11-02): a sent PDF written on on the tablet is no second item; its ink comes onto the row it
+// was sent from, where Engelbart's highlights are, and the row has its own file back when the copy goes.
+test('a sent PDF written on on the tablet: its ink comes onto the row it was sent from, highlights and all', async () => {
+  const { PDFDocument } = require('pdf-lib');
+  const { createHash, randomUUID } = require('node:crypto');
+  const { pathToFileURL } = require('node:url');
+  const pdf = await PDFDocument.create();
+  pdf.addPage([595, 842]);
+  pdf.addPage([400, 600]);
+  const bytes = await pdf.save();
+  const dir = appLibrary();
+  const ink = path.join(dir, NOTEBOOK, fs.readdirSync(path.join(dir, NOTEBOOK)).find((f) => f.endsWith('.rm')));
+  const COPY = '5e17c0de-0000-4000-8000-000000000001';
+  const [P1, PX, P2] = ['9a9e0000-0000-4000-8000-000000000001', '9a9e0000-0000-4000-8000-000000000002', '9a9e0000-0000-4000-8000-000000000003'];
+  const lww = (value) => ({ timestamp: '1:1', value });
+  const pages = (inserted) => JSON.stringify({ fileType: 'pdf', formatVersion: 2, cPages: { pages: [{ id: P1, idx: lww('ba'), redir: lww(0) }, ...(inserted ? [{ id: PX, idx: lww('bb') }] : []), { id: P2, idx: lww('bc'), redir: lww(1) }] } });
+  const addCopy = (id, name) => {
+    fs.writeFileSync(path.join(dir, `${id}.metadata`), JSON.stringify({ visibleName: name, type: 'DocumentType', parent: '', lastModified: String(Date.now() + 2000) }));
+    fs.writeFileSync(path.join(dir, `${id}.content`), pages(false));
+    fs.writeFileSync(path.join(dir, `${id}.pdf`), bytes);
+  };
+  const writeOn = (id, page) => { fs.mkdirSync(path.join(dir, id), { recursive: true }); fs.copyFileSync(ink, path.join(dir, id, `${page}.rm`)); };
+
+  const { remarkable, dataRoot, library } = syncOver(dir);
+  const root = mirrorDir(dataRoot);
+  const own = path.join(tmp('own'), 'Paper.pdf');
+  fs.writeFileSync(own, bytes);
+  const ROW = randomUUID();
+  const ctx = { ...memoryLibrary([{ id: ROW, name: 'My paper', type: 'pdf', path: own }]), dataRoot };
+  // Highlights made in Engelbart before the library held the file, filed by the file (library.cjs readAnnotations).
+  const marks = { 1: [{ id: 'm1', rects: [{ x: 10, y: 10, w: 50, h: 8 }], note: 'mine' }] };
+  const filed = path.join(dataRoot, 'annotations', 'pages', `${createHash('sha256').update(pathToFileURL(own).href).digest('hex')}.json`);
+  fs.mkdirSync(path.dirname(filed), { recursive: true });
+  fs.writeFileSync(filed, JSON.stringify(marks));
+  await remarkable.connect();
+  await settle(remarkable);
+  await reconcileRows(ctx, root);
+  assert.equal(ctx.table.size, 2, 'the row and the notebook');
+
+  remarkable.expectSent('My paper', ROW); // as ./send.cjs does, from the Stage's row
+  addCopy(COPY, 'My paper');
+  await settle(remarkable);
+  await reconcileRows(ctx, root);
+  assert.equal(ctx.table.size, 2, 'nobody wrote on it: no new item');
+  assert.equal(ctx.table.get(ROW).path, own, 'and the row is as it was');
+
+  // On the tablet: PDF page 2 written on, and a page inserted after page 1 and written on.
+  fs.writeFileSync(path.join(dir, `${COPY}.content`), pages(true));
+  writeOn(COPY, P2);
+  writeOn(COPY, PX);
+  await settle(remarkable);
+  assert.deepEqual(await reconcileRows(ctx, root), { added: 0, changed: 1, removed: 0 });
+  assert.equal(ctx.table.size, 2, 'written on: still no second item');
+  const row = ctx.table.get(ROW);
+  assert.equal(row.name, 'My paper', 'the row keeps its name');
+  assert.ok(row.path.startsWith(library() + path.sep) && row.path.endsWith('.pdf') && fs.existsSync(row.path), 'the row shows the tablet’s copy');
+  const merged = await PDFDocument.load(fs.readFileSync(row.path));
+  assert.deepEqual(merged.getPages().map((p) => [p.getWidth(), p.getHeight()]), [[595, 842], [400, 600], [595, 842]],
+    'each PDF page keeps its number (highlights are kept by page), the inserted page after them');
+  const kept = path.join(dataRoot, 'annotations', `${ROW}.json`);
+  assert.deepEqual(JSON.parse(fs.readFileSync(kept, 'utf8')), marks, 'the highlights filed by its old file stay with the row');
+  assert.deepEqual(await reconcileRows(ctx, root), { added: 0, changed: 0, removed: 0 }, 'nothing changed, nothing done');
+
+  // Disconnecting: the row stays, with its own file; connecting again puts the tablet's ink back on it.
+  await remarkable.halt();
+  assert.equal(await removeRows(ctx, root), 2, 'the notebook taken away, the row given its file back');
+  await remarkable.disconnect();
+  assert.deepEqual([...ctx.table.keys()], [ROW]);
+  assert.equal(ctx.table.get(ROW).path, own);
+  await remarkable.connect();
+  await settle(remarkable);
+  await reconcileRows(ctx, root);
+  assert.ok(ctx.table.get(ROW).path.startsWith(library() + path.sep), 'connected again: the tablet’s ink is back on the row');
+  assert.equal(ctx.table.size, 2);
+
+  // The copy put in the tablet's trash: the row stays, with its own file.
+  setParent(dir, COPY, 'trash');
+  await settle(remarkable);
+  await reconcileRows(ctx, root);
+  assert.equal(ctx.table.get(ROW).path, own);
+  assert.equal(ctx.table.size, 2, 'the row is not taken away with the copy');
+  remarkable.stop();
+});
+
+test('a sent copy with nowhere to go gets an item of its own: a second copy of one row, a row without a file, a row removed', async () => {
+  const { PDFDocument } = require('pdf-lib');
+  const { randomUUID } = require('node:crypto');
+  const pdf = await PDFDocument.create();
+  pdf.addPage([595, 842]);
+  const bytes = await pdf.save();
+  const dir = appLibrary();
+  const ink = path.join(dir, NOTEBOOK, fs.readdirSync(path.join(dir, NOTEBOOK)).find((f) => f.endsWith('.rm')));
+  const PAGE = '9a9e0000-0000-4000-8000-000000000003';
+  const addInked = (id, name) => {
+    fs.writeFileSync(path.join(dir, `${id}.metadata`), JSON.stringify({ visibleName: name, type: 'DocumentType', parent: '', lastModified: String(Date.now() + 2000) }));
+    fs.writeFileSync(path.join(dir, `${id}.content`), JSON.stringify({ fileType: 'pdf', pages: [PAGE], redirectionPageMap: [0] }));
+    fs.writeFileSync(path.join(dir, `${id}.pdf`), bytes);
+    fs.mkdirSync(path.join(dir, id));
+    fs.copyFileSync(ink, path.join(dir, id, `${PAGE}.rm`));
+  };
+  const { remarkable, dataRoot, library } = syncOver(dir);
+  const root = mirrorDir(dataRoot);
+  const own = path.join(tmp('own'), 'A.pdf');
+  fs.writeFileSync(own, bytes);
+  const [A, WEB, GONE] = [randomUUID(), randomUUID(), randomUUID()];
+  const ctx = { ...memoryLibrary([{ id: A, name: 'A', type: 'pdf', path: own }, { id: WEB, name: 'Web', type: 'pdf', path: null, url: 'https://example.org/w.pdf' }]), dataRoot };
+  await remarkable.connect();
+  await settle(remarkable);
+  remarkable.expectSent('A', A);
+  addInked('5e17c0de-0000-4000-8000-00000000000a', 'A');
+  await settle(remarkable);
+  remarkable.expectSent('A', A); // sent again
+  addInked('5e17c0de-0000-4000-8000-00000000000b', 'A');
+  remarkable.expectSent('Web', WEB);
+  addInked('5e17c0de-0000-4000-8000-00000000000c', 'Web');
+  remarkable.expectSent('Gone', GONE);
+  addInked('5e17c0de-0000-4000-8000-00000000000d', 'Gone');
+  await settle(remarkable);
+  await reconcileRows(ctx, root);
+  const rows = [...ctx.table.values()];
+  assert.ok(ctx.table.get(A).path.startsWith(library() + path.sep), 'the first copy’s ink is on row A');
+  assert.equal(ctx.table.get(WEB).path, null, 'a row without a file is left as it is');
+  assert.deepEqual(rows.filter((r) => ![A, WEB].includes(r.id)).map((r) => r.name).sort(), ['A', 'Gone', 'Test', 'Web'],
+    'the second copy of A, the copies of Web and of a removed row, and the notebook: items of their own');
+  remarkable.stop();
 });

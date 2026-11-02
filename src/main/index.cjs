@@ -909,8 +909,9 @@ if (!hasSingleInstanceLock) {
     // Send to reMarkable (remarkable/send.cjs): a PDF handed to the reMarkable app, which imports it and syncs it to the
     // tablet; its library (the one Connect reads) says when it has come. The window drags the file in when the app
     // does not take it by itself (remarkable-drag below).
-    // What it sends comes back from the app as a copy, which the sync keeps out of the library until it is written on.
-    remarkableSend = createRemarkableSend({ list: () => createRemarkableDesktop().list(), expect: (name) => remarkable.expectSent(name), arrived: (entry) => remarkable.sentArrived(entry) });
+    // What it sends comes back from the app as a copy, which the sync keeps out of the library until it is written on;
+    // then its ink goes onto the library row it was sent from (remarkable/rows.cjs).
+    remarkableSend = createRemarkableSend({ list: () => createRemarkableDesktop().list(), expect: (name, row) => remarkable.expectSent(name, row), arrived: (entry) => remarkable.sentArrived(entry) });
     const remarkableConnected = () => { try { return remarkable.status().connected; } catch { return false; } };
     setTimeout(() => { if (remarkableConnected()) { remarkable.watch(); void remarkable.autoSync().catch(() => {}); } }, 4000);
     const remarkableSchedule = scheduleRemarkableSyncs(remarkable, { connected: remarkableConnected });

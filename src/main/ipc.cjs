@@ -396,13 +396,15 @@ function registerEngelbartIpc({ ipcMain, trustedHandler, store, openExternal, re
     void rm().sync().catch(() => {});
     return rm().status();
   });
-  // Send to reMarkable (remarkable/send.cjs): remarkable-send(name, bytes) hands a PDF to the reMarkable app → { state:
-  // 'sent' | 'drop' | 'given', name, file?, since? }, or { error } in words; after a 'drop', remarkable-await-drop({ name,
-  // since }) waits for it to come into the app's library → { state: 'sent' | 'waited' }.
+  // Send to reMarkable (remarkable/send.cjs): remarkable-send(name, bytes, rowId) hands a PDF to the reMarkable app (rowId:
+  // the library row it is, whose item the tablet's ink comes back onto; null for a PDF the library does not hold) →
+  // { state: 'sent' | 'drop' | 'given', name, file?, since? }, or { error } in words; after a 'drop',
+  // remarkable-await-drop({ name, since }) waits for it to come into the app's library → { state: 'sent' | 'waited' }.
   const sender = () => { if (!remarkableSend) throw new Error('reMarkable is not available'); return remarkableSend; };
-  handle('remarkable-send', async (name, bytes) => {
+  handle('remarkable-send', async (name, bytes, rowId = null) => {
     if (!(bytes instanceof Uint8Array)) throw new TypeError('bytes must be a Uint8Array');
-    try { return await sender().send({ name: str(name, 'name', 512), bytes }); }
+    const from = optStr(rowId, 'library id', 64);
+    try { return await sender().send({ name: str(name, 'name', 512), bytes, from }); }
     catch (error) { if (error && error.code && error.code !== 'send') return { error: error.message, code: error.code }; throw error; }
   });
   handle('remarkable-await-drop', async (input) => {
