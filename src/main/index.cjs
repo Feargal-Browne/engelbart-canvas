@@ -887,7 +887,8 @@ if (!hasSingleInstanceLock) {
     const remarkableRows = {
       reconcile: () => inRowsTurn(async () => {
         const ctx = await store.context();
-        const changed = await reconcileRemarkableRows(ctx, remarkableMirrorDir(ctx.dataRoot));
+        // A row whose file changed (the tablet's ink on it now, or more of it): a Stage tab showing it takes it again.
+        const changed = await reconcileRemarkableRows(ctx, remarkableMirrorDir(ctx.dataRoot), { refreshed: (ids) => sendToWindow('engelbart:library-files', { ids }) });
         if (changed.added || changed.changed || changed.removed) { libraryChanged(); if (changed.added || changed.changed) pdfAdded(); }
       }),
       remove: () => inRowsTurn(async () => {
@@ -911,7 +912,7 @@ if (!hasSingleInstanceLock) {
     // does not take it by itself (remarkable-drag below).
     // What it sends comes back from the app as a copy, which the sync keeps out of the library until it is written on;
     // then its ink goes onto the library row it was sent from (remarkable/rows.cjs).
-    remarkableSend = createRemarkableSend({ list: () => createRemarkableDesktop().list(), expect: (name, row) => remarkable.expectSent(name, row), arrived: (entry) => remarkable.sentArrived(entry) });
+    remarkableSend = createRemarkableSend({ list: () => createRemarkableDesktop().list(), expect: (name, row, source) => remarkable.expectSent(name, row, source), arrived: (entry) => remarkable.sentArrived(entry) });
     const remarkableConnected = () => { try { return remarkable.status().connected; } catch { return false; } };
     setTimeout(() => { if (remarkableConnected()) { remarkable.watch(); void remarkable.autoSync().catch(() => {}); } }, 4000);
     const remarkableSchedule = scheduleRemarkableSyncs(remarkable, { connected: remarkableConnected });
@@ -1067,6 +1068,7 @@ if (!hasSingleInstanceLock) {
           if (result.state === 'drop') remarkableDragIcons.set(result.file, await app.getFileIcon(result.file).catch(() => null));
           return result;
         },
+        check: (bytes) => remarkableSend.check(bytes),
         awaitDrop: (input) => remarkableSend.awaitDrop(input),
         cancel: (name) => remarkableSend.cancel(name),
       },

@@ -27,21 +27,29 @@
 // A PDF sent from Engelbart (./send.cjs) comes back as a document of its own: while nobody has written on it, it is
 // the PDF it was sent from over again, and is left out of the library; once it has ink or highlights it is converted
 // (its pages in the PDF's own order, so each keeps its number) and its ink goes onto the library row it was sent from
-// (./rows.cjs), where Engelbart's highlights are. sent.json: which documents those are ({ ids: { [id]: at } }), the row
-// each was sent from ({ from: { [id]: row } }), and the names of ones on their way ({ pending: [{ key, at, row }] },
-// matched to the first new PDF of that name, kept a week). It stays through a disconnect, as rows.json does.
+// (./rows.cjs), where Engelbart's highlights are. It is drawn on the PDF as it was before Engelbart's highlights were
+// drawn into it for the tablet (sent/<token>.pdf), so they are not shown twice. Copies sent from one row are one item:
+// the first sent carries the ink of them all (./convert.cjs `with`) and the others write nothing. sent.json: which
+// documents those are ({ ids: { [id]: at } }), the row each was sent from ({ from: { [id]: row } }), what each was sent
+// as ({ sources: { [id]: token } }), and the names of ones on their way ({ pending: [{ key, at, row, source }] },
+// matched to the first new PDF of that name, kept a week). sent.json and sent/ stay through a disconnect, as rows.json
+// does; a source goes when its copy is put in the tablet's trash or never came.
 // When: on connecting, a little after launch, whenever the app's library changes (it is watched while connected; the
 // reMarkable app writes there as the tablet syncs), when a window comes to the front after 2 minutes, and every
 // 10 minutes. Never two at once; one asked for meanwhile runs after.
 
 const fs = require('node:fs');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const { Worker } = require('node:worker_threads');
 const { convertDocument, CONVERT_VERSION } = require('./convert.cjs');
 
 const VERSION = 1;
 const ROWS_FILE = 'rows.json'; // ./rows.cjs's: kept through a disconnect
 const SENT_FILE = 'sent.json'; // copies sent from Engelbart: kept through a disconnect
+const SENT_DIR = 'sent'; // what each was sent as, before Engelbart's highlights were drawn in: kept with sent.json
+const TOKEN_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const SOURCE_GRACE_MS = 10 * 60_000; // a source this new is never pruned (a send may be writing sent.json)
 const PENDING_MS = 7 * 24 * 60 * 60_000;
 const SLACK_MS = 60_000; // a sent copy's lastModified against the time it was sent: clocks, and the app's own writes
 const EVERY_MS = 10 * 60_000;
@@ -57,9 +65,12 @@ class RemarkableError extends Error {
 
 const readJson = (file) => { try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; } };
 function writeJson(file, value) {
+  writeBytes(file, `${JSON.stringify(value, null, 1)}\n`);
+}
+function writeBytes(file, bytes) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 1)}\n`);
+  fs.writeFileSync(temporary, bytes);
   fs.renameSync(temporary, file);
 }
 
@@ -125,6 +136,17 @@ function placeAll(entries, previous, reserved = []) {
 
 /** A kept document's record without its mark: the app lists it again. */
 const listedAgain = ({ gone: _gone, ...item }) => item;
+
+/**
+ * What a document's conversion is asked beyond its files, from its record: a sent copy's (./convert.cjs
+ * unlessUntouched, order, source, with). The same for a sync's pass and the handwriting pass, so both write one PDF.
+ */
+const jobFor = (item, at) => ({
+  ...(item.sent ? { unlessUntouched: true } : {}),
+  ...(item.from ? { order: 'source' } : {}),
+  ...(Array.isArray(item.with) && item.with.length ? { with: item.with } : {}),
+  ...(item.source ? { source: path.join(at, SENT_DIR, `${item.source}.pdf`) } : {}),
+});
 
 /** A document's files, relative to library/: its PDF (not for an ebook) and its Markdown. */
 const filesOf = (place, fileType) => {
@@ -275,12 +297,12 @@ function createRemarkableSync({ root, bridge = null, findLibrary = null, source 
     const at = rootNow();
     // The copies go; rows.json (./rows.cjs, which library row each document was) stays, so connecting again brings the
     // same rows back, and with them what was made of them in Engelbart (ink, notes, stars, mentions, workspaces); and
-    // sent.json, so a copy sent from Engelbart stays out of the library.
+    // sent.json and sent/, so a copy sent from Engelbart stays out of the library and its ink goes onto its row.
     const removeRoot = () => {
       if (!at) return;
       let names = [];
       try { names = fs.readdirSync(at); } catch { return; }
-      for (const name of names) if (name !== ROWS_FILE && name !== SENT_FILE) { try { fs.rmSync(path.join(at, name), { recursive: true, force: true }); } catch { /* already gone */ } }
+      for (const name of names) if (name !== ROWS_FILE && name !== SENT_FILE && name !== SENT_DIR) { try { fs.rmSync(path.join(at, name), { recursive: true, force: true }); } catch { /* already gone */ } }
     };
     removeRoot();
     // A conversion under way writes its files when it ends: they go too.
@@ -354,9 +376,24 @@ function createRemarkableSync({ root, bridge = null, findLibrary = null, source 
       const [p] = sent.pending.splice(i, 1);
       sent.ids[e.id] = p.at;
       if (p.row) sent.from[e.id] = p.row;
+      if (p.source) sent.sources[e.id] = p.source;
       claims.push({ id: e.id, ...p });
       return true;
     };
+    // Copies sent from one row: the first sent carries the ink of them all; the others are joined to it.
+    const copies = new Map(); // row → its copies, first sent first
+    for (const e of entries) {
+      if (e.kind !== 'document' || !sentCopy(e) || !sent.from[e.id]) continue;
+      const list = copies.get(sent.from[e.id]) || [];
+      copies.set(sent.from[e.id], [...list, e]);
+    }
+    const joinedTo = new Map(); // a later copy's id → the first's
+    const othersOf = new Map(); // the first's id → the later copies
+    for (const list of copies.values()) {
+      const [head, ...rest] = list.sort((a, b) => (Number(sent.ids[a.id]) || 0) - (Number(sent.ids[b.id]) || 0) || a.id.localeCompare(b.id));
+      othersOf.set(head.id, rest);
+      for (const e of rest) joinedTo.set(e.id, head.id);
+    }
     const items = {};
     const problems = [];
     const live = new Set(); // nameKeys of the files that stay
@@ -373,14 +410,23 @@ function createRemarkableSync({ root, bridge = null, findLibrary = null, source 
       const files = filesOf(place, e.fileType);
       const copy = sentCopy(e);
       const from = (copy && sent.from[e.id]) || null; // the library row it was sent from
+      if (joinedTo.has(e.id)) {
+        // A later copy of a row's: its ink is in the first's PDF.
+        items[e.id] = { kind: 'document', name: e.name, version: e.version, lastModified: e.lastModified, dir: place.dir, base: place.base, files: [], convert: CONVERT_VERSION, hw: 'read', sent: true, from, joined: joinedTo.get(e.id) };
+        continue;
+      }
+      const others = (othersOf.get(e.id) || []).map((o) => o.id);
+      const version = [e.version, ...(othersOf.get(e.id) || []).map((o) => `${o.id}:${o.version}`)].join('|');
+      const source = (from && sent.sources[e.id]) || null;
+      const extra = { ...(copy ? { sent: true } : {}), ...(from ? { from } : {}), ...(others.length ? { with: others } : {}), ...(source ? { source } : {}) };
       // Listed again after the app had stopped listing it: itself again, no longer kept.
       const was = previous[e.id] ? listedAgain(previous[e.id]) : undefined;
-      const same = was && was.version === e.version && was.convert === CONVERT_VERSION && was.dir === place.dir && was.base === place.base
-        && !!was.sent === copy && (was.from || null) === from && (was.files || []).every(exists);
+      const same = was && was.version === version && was.convert === CONVERT_VERSION && was.dir === place.dir && was.base === place.base
+        && !!was.sent === copy && (was.from || null) === from && (was.source || null) === source && (was.files || []).every(exists);
       if (same) { items[e.id] = { ...was, name: e.name }; for (const rel of was.files) keep(rel); continue; }
       // One that failed as it is now is tried again when it changes, or once in a later run of the app; never on every
       // sync (a big one can take seconds to fail).
-      if (was && was.failed && was.failed.version === e.version && was.convert === CONVERT_VERSION && tried.has(e.id)) {
+      if (was && was.failed && was.failed.version === version && was.convert === CONVERT_VERSION && tried.has(e.id)) {
         items[e.id] = { ...was, name: e.name };
         for (const rel of was.files || []) keep(rel);
         problems.push({ name: e.name, error: was.failed.error });
@@ -391,16 +437,16 @@ function createRemarkableSync({ root, bridge = null, findLibrary = null, source 
         const pdf = files.pdf && inLibrary(library, files.pdf), md = inLibrary(library, files.md);
         if ((files.pdf && !pdf) || !md) throw new RemarkableError('Its name cannot be made into a file name here.', 'name');
         // Handwriting already read (by page) goes in now; what is not is read after, a document at a time (readAll).
-        const done = await convertOne({ dir: s.dir, id: e.id, pdf, md, handwriting: handwriting ? 'cached' : false, cacheDir: path.join(at, 'handwriting'), ...(copy ? { unlessUntouched: true } : {}), ...(from ? { order: 'source' } : {}) });
+        const done = await convertOne({ dir: s.dir, id: e.id, pdf, md, handwriting: handwriting ? 'cached' : false, cacheDir: path.join(at, 'handwriting'), ...jobFor(extra, at) });
         if (run !== generation) return problems;
         const written = [...(done.pdf ? [files.pdf] : []), ...(done.md ? [files.md] : [])];
         const hw = done.handwriting || {};
-        items[e.id] = { kind: 'document', name: e.name, version: e.version, lastModified: e.lastModified, dir: place.dir, base: place.base, files: written, convert: CONVERT_VERSION, hw: hw.supported && hw.unread > 0 ? 'pending' : 'read', ...(copy ? { sent: true } : {}), ...(from ? { from } : {}) };
+        items[e.id] = { kind: 'document', name: e.name, version, lastModified: e.lastModified, dir: place.dir, base: place.base, files: written, convert: CONVERT_VERSION, hw: hw.supported && hw.unread > 0 ? 'pending' : 'read', ...extra };
         for (const rel of written) keep(rel);
       } catch (error) {
         // Its files from before stay as they were.
         problems.push({ name: e.name, error: words(error) });
-        items[e.id] = { kind: 'document', version: '', dir: place.dir, base: place.base, ...(was || {}), name: e.name, files: (was && was.files) || [], convert: CONVERT_VERSION, failed: { version: e.version, error: words(error) } };
+        items[e.id] = { kind: 'document', version: '', dir: place.dir, base: place.base, ...(was || {}), ...extra, name: e.name, files: (was && was.files) || [], convert: CONVERT_VERSION, failed: { version, error: words(error) } };
         for (const rel of items[e.id].files) keep(rel);
       }
     }
@@ -420,13 +466,29 @@ function createRemarkableSync({ root, bridge = null, findLibrary = null, source 
       for (const c of claims) {
         now_.ids[c.id] = c.at;
         if (c.row) now_.from[c.id] = c.row;
+        if (c.source) now_.sources[c.id] = c.source;
         const i = now_.pending.findIndex((p) => p.key === c.key && p.at === c.at);
         if (i >= 0) now_.pending.splice(i, 1);
       }
       writeJson(path.join(at, SENT_FILE), now_);
     }
     writeJson(path.join(at, 'state.json'), { v: VERSION, connected: true, dir: s.dir, syncedAt: new Date(now()).toISOString(), items });
+    pruneSources(at, items);
     return problems;
+  }
+
+  /** What copies were sent as, gone once nothing needs them: the copy in the tablet's trash, or a send that never came. */
+  function pruneSources(at, items) {
+    const dir = path.join(at, SENT_DIR);
+    let names;
+    try { names = fs.readdirSync(dir); } catch { return; }
+    const sent = readSent(at);
+    const wanted = new Set([...sent.pending.map((p) => p.source), ...Object.entries(sent.sources).filter(([id]) => items[id]).map(([, token]) => token)].filter(Boolean).map((token) => `${token}.pdf`));
+    for (const name of names) {
+      if (wanted.has(name)) continue;
+      const file = path.join(dir, name);
+      try { if (Date.now() - fs.statSync(file).mtimeMs > SOURCE_GRACE_MS) fs.rmSync(file, { force: true }); } catch { /* in use, or gone */ }
+    }
   }
 
   /** sent.json, its pending names over a week old let go. */
@@ -435,19 +497,28 @@ function createRemarkableSync({ root, bridge = null, findLibrary = null, source 
     const object = (value) => (value && typeof value === 'object' && !Array.isArray(value) ? value : {});
     const ids = object(was.ids);
     const from = Object.fromEntries(Object.entries(object(was.from)).filter(([, row]) => typeof row === 'string'));
-    const pending = (Array.isArray(was.pending) ? was.pending : []).filter((p) => p && typeof p.key === 'string' && now() - p.at < PENDING_MS);
-    return { ids, from, pending };
+    const sources = Object.fromEntries(Object.entries(object(was.sources)).filter(([, token]) => typeof token === 'string' && TOKEN_RE.test(token)));
+    const pending = (Array.isArray(was.pending) ? was.pending : []).filter((p) => p && typeof p.key === 'string' && now() - p.at < PENDING_MS)
+      .map((p) => (p.source && !(typeof p.source === 'string' && TOKEN_RE.test(p.source)) ? { ...p, source: undefined } : p));
+    return { ids, from, sources, pending };
   }
 
   /**
    * A PDF called `name` is being sent from Engelbart (./send.cjs), from the library row `row` (null: a PDF the library
-   * does not hold): the first new PDF of that name is its copy, and its ink goes onto that row.
+   * does not hold): the first new PDF of that name is its copy, and its ink goes onto that row, drawn on `source` (the
+   * PDF's bytes before Engelbart's highlights were drawn in for the tablet), kept in sent/.
    */
-  function expectSent(name, row = null) {
+  function expectSent(name, row = null, source = null) {
     const at = rootNow();
     if (!at) return;
     const sent = readSent(at);
-    sent.pending.push({ key: nameKey(name), at: now(), ...(typeof row === 'string' && row ? { row } : {}) });
+    const from = typeof row === 'string' && row ? row : null;
+    let token = null;
+    if (from && source && source.length) {
+      token = randomUUID();
+      try { writeBytes(path.join(at, SENT_DIR, `${token}.pdf`), source); } catch { token = null; }
+    }
+    sent.pending.push({ key: nameKey(name), at: now(), ...(from ? { row: from } : {}), ...(token ? { source: token } : {}) });
     writeJson(path.join(at, SENT_FILE), sent);
   }
 
@@ -460,6 +531,7 @@ function createRemarkableSync({ root, bridge = null, findLibrary = null, source 
     const p = i < 0 ? null : sent.pending.splice(i, 1)[0];
     sent.ids[id] = p ? p.at : now();
     if (p && p.row) sent.from[id] = p.row;
+    if (p && p.source) sent.sources[id] = p.source;
     writeJson(path.join(at, SENT_FILE), sent);
   }
 
@@ -490,7 +562,7 @@ function createRemarkableSync({ root, bridge = null, findLibrary = null, source 
       if ((!pdfRel || pdf) && md) {
         reading = true;
         try {
-          const out = await convertOne({ dir: s0.dir, id, pdf, md, handwriting: 'all', cacheDir: path.join(at, 'handwriting') });
+          const out = await convertOne({ dir: s0.dir, id, pdf, md, handwriting: 'all', cacheDir: path.join(at, 'handwriting'), ...jobFor(item, at) });
           next = { ...item, files: [...(out.pdf ? [pdfRel] : []), ...(out.md ? [`${stem}.md`] : [])], hw: 'read' };
           read += 1;
         } catch (error) {

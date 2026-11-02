@@ -17,13 +17,11 @@ import SendToRemarkable from './SendToRemarkable.jsx';
 
 const IS_MAC = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || '');
 
-// A pdf that is the reMarkable's already: a document of the tablet's, or a row whose ink came back from it (its file the
-// reMarkable mirror's, src/main/remarkable/rows.cjs). Send to reMarkable is not offered for it.
+// A pdf that is a document of the tablet's (src/main/remarkable/rows.cjs rowKind 'tablet'; one not in the library, by its
+// file in the reMarkable mirror): Send to reMarkable is not offered for it. A row the tablet's ink came back onto
+// ('merged') can be sent again, to take the highlights made since.
 const IN_REMARKABLE = /\/\.remarkable\/library\//;
-const fromRemarkable = (pdf, library) => {
-  const row = pdf.rowId ? (library || []).find((r) => r.id === pdf.rowId) : null;
-  return IN_REMARKABLE.test(String(pdf.input || '')) || IN_REMARKABLE.test(String((row && row.path) || ''));
-};
+const fromRemarkable = (pdf, kinds) => (pdf.rowId ? kinds[pdf.rowId] === 'tablet' : IN_REMARKABLE.test(String(pdf.input || '')));
 
 // The Stage (Claude Design "Add - Mention Stage.dc.html", 2026-09-23): the Browser and the Paper pane made one. A tab
 // shows whatever it was given — a library row, a link, a file on disk — in the way its format asks:
@@ -431,7 +429,8 @@ const Stage = React.forwardRef(function Stage({ projectId, visible, full, onFull
   const [pick, setPick] = React.useState(0); // the row of the address list Enter takes
   const [found, setFound] = React.useState(null); // the library's answer for a typed place: { input, row }
   const [saving, setSaving] = React.useState(false); // the Save card is open
-  const [sendingPdf, setSendingPdf] = React.useState(null); // Send to reMarkable's card: { name, bytes, rowId, seq }
+  const [sendingPdf, setSendingPdf] = React.useState(null); // Send to reMarkable's card: { name, bytes, rowId, input, tabId, pdfSeq, seq }
+  const [rowKinds, setRowKinds] = React.useState({}); // library row → what it is to reMarkable (rowKind), as asked
   const [finding, setFinding] = React.useState(false); // the find card is open
   const [findText, setFindText] = React.useState('');
   const [matches, setMatches] = React.useState(null); // { matches, active } in the tab in front
@@ -770,6 +769,50 @@ const Stage = React.forwardRef(function Stage({ projectId, visible, full, onFull
       });
       return changed ? next : current;
     });
+  };
+  // A library row's file changed under an open tab (main's engelbart:library-files: a reMarkable notebook synced, or the
+  // tablet's ink come onto a PDF sent from here): the tab reads it again as the same paper (its seq) with new bytes, so
+  // PaperView keeps its place and its ink. Not while a note is being typed in the Stage: once the typing stops.
+  const staleTabs = React.useRef(new Set());
+  const refreshStale = React.useCallback(() => {
+    const active = document.activeElement;
+    const typing = !!active && !!rootRef.current && rootRef.current.contains(active) && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT' || active.isContentEditable);
+    for (const id of [...staleTabs.current]) {
+      if (typing && id === frontRef.current) continue;
+      staleTabs.current.delete(id);
+      const t = tabsRef.current.find((x) => x.id === id);
+      if (!t || !t.pdf || !t.pdf.rowId || t.pdf.loading) continue;
+      const { seq, rowId } = t.pdf;
+      api.readLibraryFile(rowId)
+        .then((file) => update(id, (x) => (x.pdf && x.pdf.seq === seq && x.pdf.rowId === rowId ? { ...x, pdf: { ...x.pdf, bytes: file.bytes } } : x)))
+        .catch(() => {}); // the tab keeps what it shows
+    }
+  }, [update]);
+  React.useEffect(() => {
+    if (!api.onLibraryFiles) return undefined;
+    const off = api.onLibraryFiles((told) => {
+      const ids = new Set(told && Array.isArray(told.ids) ? told.ids : []);
+      for (const t of tabsRef.current) if (t.pdf && t.pdf.rowId && ids.has(t.pdf.rowId)) staleTabs.current.add(t.id);
+      for (const id of ids) setRowKinds((kinds) => (id in kinds ? { ...kinds, [id]: undefined } : kinds)); // asked again
+      refreshStale();
+    });
+    const later = () => setTimeout(refreshStale, 0);
+    document.addEventListener('focusout', later);
+    return () => { off(); document.removeEventListener('focusout', later); };
+  }, [refreshStale]);
+  // What the pdf in front is to reMarkable (a document of the tablet's is not sent to it again).
+  const kindRow = pdf && pdf.rowId ? pdf.rowId : null;
+  const kindKnown = kindRow ? rowKinds[kindRow] !== undefined : true;
+  React.useEffect(() => {
+    if (!kindRow || kindKnown || !api.remarkableRowKind) return undefined;
+    let live = true;
+    api.remarkableRowKind(kindRow).then((kind) => { if (live) setRowKinds((kinds) => ({ ...kinds, [kindRow]: kind || null })); }).catch(() => {});
+    return () => { live = false; };
+  }, [kindRow, kindKnown]);
+  // Send to reMarkable saved a pdf the library did not hold (main's rowForSend): its tab is that row's from now on, so
+  // its ink is kept by the row, where the tablet's comes back.
+  const adoptRow = (tabId, seq, rowId) => {
+    if (rowId) update(tabId, (t) => (t.pdf && t.pdf.seq === seq && !t.pdf.rowId ? { ...t, pdf: { ...t.pdf, rowId } } : t));
   };
   // How a question from a highlight ended, told to every window by main: its answer lands here too (landAnswer).
   const landRef = React.useRef(landAnswer);
@@ -1326,7 +1369,7 @@ const Stage = React.forwardRef(function Stage({ projectId, visible, full, onFull
           <button type="button" className="hov-wash" data-stage-box={boxing === tab.id ? 'on' : 'off'} aria-pressed={boxing === tab.id} onClick={() => quiet(api.browserBox(tab.id))} aria-label="Box part of the page" title="Box part of the page (or hold ⌥ and drag)" style={{ ...ICON_BUTTON, display: 'flex', alignItems: 'center', justifyContent: 'center', background: boxing === tab.id ? '#f2f2f2' : 'transparent', color: boxing === tab.id ? '#0070f3' : '#4d4d4d' }}><BoxGlyph /></button>
         )}
         {saving && saveState === 'none' && <SaveCard key={pageInput} title={pageTitle || stripScheme(pageInput)} onSave={save.onSave} onClose={() => setSaving(false)} cardRef={saveCard} />}
-        {sendingPdf && <SendToRemarkable key={sendingPdf.seq} name={sendingPdf.name} bytes={sendingPdf.bytes} rowId={sendingPdf.rowId} onClose={() => setSendingPdf(null)} />}
+        {sendingPdf && <SendToRemarkable key={sendingPdf.seq} name={sendingPdf.name} bytes={sendingPdf.bytes} rowId={sendingPdf.rowId} input={sendingPdf.input} onRow={(rowId) => adoptRow(sendingPdf.tabId, sendingPdf.pdfSeq, rowId)} onClose={() => setSendingPdf(null)} />}
         <div style={{ position: 'relative' }} ref={menuRef}>
           <button type="button" className="hov-wash" onClick={(event) => { const r = event.currentTarget.getBoundingClientRect(); setMenu(menu ? null : { x: r.right, y: r.bottom }); }} aria-label="More" style={{ ...ICON_BUTTON, background: menu ? '#f2f2f2' : 'transparent', font: '600 16px/1 var(--font-sans)', color: '#4d4d4d' }}>⋮</button>
           {menu && (
@@ -1349,9 +1392,9 @@ const Stage = React.forwardRef(function Stage({ projectId, visible, full, onFull
                   {page && <div className="hov-wash" onClick={() => { quiet(api.browserCommand(tab.id, 'devtools')); setMenu(null); }} style={{ padding: '7px 10px 7px 34px', borderRadius: 6, cursor: 'pointer', font: '13px/1.4 var(--font-sans)', color: '#171717' }}>Developer tools</div>}
                 </div>
               )}
-              {IS_MAC && pdf && pdf.bytes && !fromRemarkable(pdf, library) && (
+              {IS_MAC && pdf && pdf.bytes && !fromRemarkable(pdf, rowKinds) && (
                 <div style={{ borderTop: '1px solid #eaeaea', marginTop: 4, paddingTop: 4 }}>
-                  <div className="hov-wash" data-stage-send-remarkable="1" onClick={() => { setMenu(null); setSendingPdf({ name: pdf.name, bytes: pdf.bytes, rowId: pdf.rowId || null, seq: Date.now() }); }} style={{ padding: '7px 10px 7px 34px', borderRadius: 6, cursor: 'pointer', font: '13px/1.4 var(--font-sans)', color: '#171717' }}>Send to reMarkable</div>
+                  <div className="hov-wash" data-stage-send-remarkable="1" onClick={() => { setMenu(null); setSendingPdf({ name: pdf.name, bytes: pdf.bytes, rowId: pdf.rowId || null, input: pageInput || null, tabId: tab.id, pdfSeq: pdf.seq, seq: Date.now() }); }} style={{ padding: '7px 10px 7px 34px', borderRadius: 6, cursor: 'pointer', font: '13px/1.4 var(--font-sans)', color: '#171717' }}>Send to reMarkable</div>
                 </div>
               )}
               {IS_MAC && (

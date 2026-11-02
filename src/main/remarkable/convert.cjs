@@ -58,47 +58,74 @@ function cloneAtomic(from, file) {
   fs.renameSync(temporary, file);
 }
 
+/** Whether a document is a PDF nobody wrote on, its pages as they came (its own file `original` there to clone). */
+const isUntouched = (bundle, doc, original) => bundle.content.fileType === 'pdf'
+  && doc.pages.every((p) => !p.page && !p.error && p.ref.sourcePage === p.ref.index)
+  && (bundle.content.originalPageCount === null || bundle.content.originalPageCount === doc.pages.length) && fs.existsSync(original);
+
 /**
- * `{ dir, id, pdf, md, handwriting, cacheDir, unlessUntouched, order }`: the library folder, the document, the absolute paths
- * to write (`pdf` null for an ebook), and how to read its handwriting: 'all' (what the cache in `cacheDir` lacks is read now),
- * 'cached' (only what the cache has: a sync's first pass, so documents come in fast), or false. `deps.recognize`
- * replaces the Mac's reading (the tests); `deps.signal` stops a reading under way (it rejects, code 'aborted': what
- * was read stays in the cache). `unlessUntouched`: a PDF nobody has written on is not written at all, and its files from
- * before go (a copy sent from Engelbart: ./send.cjs). `order`: 'source' keeps a PDF's pages in its own order, with pages
- * inserted on the tablet after them (bridge documentToPdf), for a copy whose ink goes onto the library row it was sent
- * from, where Engelbart's highlights are kept by page number. → { pdf, md: written?, pages, untouched, handwriting: {
+ * `{ dir, id, pdf, md, handwriting, cacheDir, unlessUntouched, order, source, with }`: the library folder, the document,
+ * the absolute paths to write (`pdf` null for an ebook), and how to read its handwriting: 'all' (what the cache in
+ * `cacheDir` lacks is read now), 'cached' (only what the cache has: a sync's first pass, so documents come in fast), or
+ * false. `deps.recognize` replaces the Mac's reading (the tests); `deps.signal` stops a reading under way (it rejects,
+ * code 'aborted': what was read stays in the cache). `unlessUntouched`: a PDF nobody has written on is not written at
+ * all, and its files from before go (a copy sent from Engelbart: ./send.cjs). `order`: 'source' keeps a PDF's pages in
+ * its own order, with pages inserted on the tablet after them (bridge documentToPdf), for a copy whose ink goes onto
+ * the library row it was sent from, where Engelbart's highlights are kept by page number. `source`: the PDF to draw on
+ * instead of the document's own (a sent copy's, as it was before Engelbart's highlights were drawn into it, so they
+ * are not shown twice). `with`: other documents (more copies sent from the same row) whose ink is drawn in too, after
+ * this one's; a PDF is untouched only when all of them are. → { pdf, md: written?, pages, untouched, handwriting: {
  * pages, unread, supported } }. A `.md` with nothing to say is removed rather than left stale.
  */
-async function convertDocument({ dir, id, pdf, md, handwriting = false, cacheDir = null, unlessUntouched = false, order = 'tablet' }, deps = {}) {
+async function convertDocument({ dir, id, pdf, md, handwriting = false, cacheDir = null, unlessUntouched = false, order = 'tablet', source = null, with: others = [] }, deps = {}) {
   const bridge = require('remarkable-bridge');
-  const source = bridge.createFolderSource(dir);
-  const bundle = await source.open(id);
-  const doc = await bridge.readDocument(bundle);
-  const read = handwriting
-    ? await bridge.readHandwriting(doc, { mode: handwriting === 'all' ? 'all' : 'cached', ...(cacheDir ? { cache: diskCache(cacheDir) } : {}), ...(deps.recognize ? { recognize: deps.recognize } : {}), ...(deps.signal ? { signal: deps.signal } : {}) })
-      .catch((error) => { throw deps.signal && deps.signal.aborted ? Object.assign(new Error('Stopped'), { code: 'aborted' }) : error; })
-    : { handwriting: new Map(), pages: 0, unread: 0, supported: false };
-  let wrotePdf = false;
-  // A PDF nobody wrote on, its pages as they came: the file itself, cloned rather than rewritten (most of a library).
-  const original = path.join(dir, `${id}.pdf`);
-  const untouched = bundle.content.fileType === 'pdf' && doc.pages.every((p) => !p.page && !p.error && p.ref.sourcePage === p.ref.index)
-    && (bundle.content.originalPageCount === null || bundle.content.originalPageCount === doc.pages.length) && fs.existsSync(original);
+  const folder = bridge.createFolderSource(dir);
+  const readOne = async (docId) => {
+    const bundle = await folder.open(docId);
+    const doc = await bridge.readDocument(bundle);
+    const read = handwriting
+      ? await bridge.readHandwriting(doc, { mode: handwriting === 'all' ? 'all' : 'cached', ...(cacheDir ? { cache: diskCache(cacheDir) } : {}), ...(deps.recognize ? { recognize: deps.recognize } : {}), ...(deps.signal ? { signal: deps.signal } : {}) })
+        .catch((error) => { throw deps.signal && deps.signal.aborted ? Object.assign(new Error('Stopped'), { code: 'aborted' }) : error; })
+      : { handwriting: new Map(), pages: 0, unread: 0, supported: false };
+    return { bundle, doc, read, original: path.join(dir, `${docId}.pdf`), untouched: isUntouched(bundle, doc, path.join(dir, `${docId}.pdf`)) };
+  };
+  const first = await readOne(id);
+  const rest = [];
+  for (const other of Array.isArray(others) ? others : []) {
+    try { rest.push(await readOne(other)); } catch (error) { if (error && error.code === 'aborted') throw error; /* a copy that cannot be read adds no ink */ }
+  }
+  const all = [first, ...rest];
+  const stats = { pages: all.reduce((n, x) => n + x.read.pages, 0), unread: all.reduce((n, x) => n + x.read.unread, 0), supported: first.read.supported };
+  const inked = all.filter((x) => !x.untouched);
+  const untouched = inked.length === 0;
   if (untouched && unlessUntouched) {
     for (const file of [pdf, md]) if (file) fs.rmSync(file, { force: true });
-    return { pdf: false, md: false, pages: doc.pages.length, untouched, handwriting: { pages: read.pages, unread: read.unread, supported: read.supported } };
+    return { pdf: false, md: false, pages: first.doc.pages.length, untouched, handwriting: stats };
   }
-  if (pdf && untouched) {
-    cloneAtomic(original, pdf);
+  let wrotePdf = false;
+  const asPdf = first.bundle.content.fileType !== 'epub';
+  const drawOn = source && fs.existsSync(source) ? source : null;
+  if (pdf && asPdf && (drawOn || rest.length)) {
+    // Each copy's ink in turn, onto what the first was sent as.
+    let bytes = drawOn ? new Uint8Array(fs.readFileSync(drawOn)) : await first.bundle.source();
+    for (const x of inked) bytes = await bridge.documentToPdf(x.doc, { source: bytes, handwriting: x.read.handwriting, order: order === 'source' ? 'source' : 'tablet' });
+    writeAtomic(pdf, bytes);
     wrotePdf = true;
-  } else if (pdf && bundle.content.fileType !== 'epub') {
-    writeAtomic(pdf, await bridge.documentToPdf(doc, { source: await bundle.source(), handwriting: read.handwriting, order: order === 'source' ? 'source' : 'tablet' }));
+  } else if (pdf && untouched) {
+    // A PDF nobody wrote on, its pages as they came: the file itself, cloned rather than rewritten (most of a library).
+    cloneAtomic(first.original, pdf);
+    wrotePdf = true;
+  } else if (pdf && asPdf) {
+    writeAtomic(pdf, await bridge.documentToPdf(first.doc, { source: await first.bundle.source(), handwriting: first.read.handwriting, order: order === 'source' ? 'source' : 'tablet' }));
     wrotePdf = true;
   }
-  const text = bridge.documentMarkdown(doc, { handwriting: read.handwriting });
+  // The first's Markdown, and what the others add to it below its title.
+  const texts = (inked.length ? inked : [first]).map((x) => bridge.documentMarkdown(x.doc, { handwriting: x.read.handwriting }));
+  const text = [texts[0], ...texts.slice(1).map((t) => t.split('\n').slice(1).join('\n').trim()).filter(Boolean)].join('\n\n');
   const said = text.split('\n').slice(1).join('\n').trim(); // past the title
   if (said) writeAtomic(md, `${text}\n`);
   else fs.rmSync(md, { force: true });
-  return { pdf: wrotePdf, md: !!said, pages: doc.pages.length, untouched, handwriting: { pages: read.pages, unread: read.unread, supported: read.supported } };
+  return { pdf: wrotePdf, md: !!said, pages: first.doc.pages.length, untouched, handwriting: stats };
 }
 
 // As a worker: one conversion per message, answered with { seq, ok, result } or { seq, ok: false, error }; { abort: true }

@@ -12,6 +12,9 @@ const home = require('./store/home.cjs');
 const db = require('./store/db.cjs');
 const projects = require('./store/projects.cjs');
 const library = require('./store/library.cjs');
+const { rowForSend } = require('./remarkable/send.cjs');
+const { rowKind } = require('./remarkable/rows.cjs');
+const { mirrorDir: remarkableMirrorDir } = require('./remarkable/sync.cjs');
 const folderFiles = require('./store/folder-files.cjs');
 const zoteroMirror = require('./zotero/mirror.cjs');
 const { expandDoc } = require('./context/expand-mentions.cjs');
@@ -396,15 +399,26 @@ function registerEngelbartIpc({ ipcMain, trustedHandler, store, openExternal, re
     void rm().sync().catch(() => {});
     return rm().status();
   });
-  // Send to reMarkable (remarkable/send.cjs): remarkable-send(name, bytes, rowId) hands a PDF to the reMarkable app (rowId:
-  // the library row it is, whose item the tablet's ink comes back onto; null for a PDF the library does not hold) →
-  // { state: 'sent' | 'drop' | 'given', name, file?, since? }, or { error } in words; after a 'drop',
-  // remarkable-await-drop({ name, since }) waits for it to come into the app's library → { state: 'sent' | 'waited' }.
+  // Send to reMarkable (remarkable/send.cjs): remarkable-send(name, bytes, rowId, input) hands a PDF to the reMarkable app,
+  // with the highlights made on it in Engelbart drawn in. rowId: the library row it is, whose item the tablet's ink comes
+  // back onto; without one, `input` (its address or path) is looked up in the library, and saved to it when it is not
+  // there (rowForSend). → { state: 'sent' | 'drop' | 'given', name, file?, since?, highlights, rowId, saved }, or
+  // { error } in words; after a 'drop', remarkable-await-drop({ name, since }) waits for it to come into the app's
+  // library → { state: 'sent' | 'waited' }.
   const sender = () => { if (!remarkableSend) throw new Error('reMarkable is not available'); return remarkableSend; };
-  handle('remarkable-send', async (name, bytes, rowId = null) => {
+  handle('remarkable-send', async (name, bytes, rowId = null, input = null) => {
     if (!(bytes instanceof Uint8Array)) throw new TypeError('bytes must be a Uint8Array');
-    const from = optStr(rowId, 'library id', 64);
-    try { return await sender().send({ name: str(name, 'name', 512), bytes, from }); }
+    const title = str(name, 'name', 512);
+    const at = { rowId: optStr(rowId, 'library id', 64), input: optStr(input, 'address', 8192) };
+    try {
+      await sender().check(bytes); // before anything is saved for it
+      const ctx = await store.context();
+      const { row, saved } = await rowForSend(ctx, { ...at, bytes, name: title.slice(0, 200) }, { library, inspectPdf });
+      if (saved) { announce('engelbart:library-changed', {}); pdfAdded(); }
+      let marks = null;
+      try { marks = row ? await library.readAnnotations(ctx, row.id) : at.input ? await library.readPageAnnotations(ctx, at.input) : null; } catch { marks = null; }
+      return { ...(await sender().send({ name: title, bytes, from: row ? row.id : null, marks })), rowId: row ? row.id : null, saved };
+    }
     catch (error) { if (error && error.code && error.code !== 'send') return { error: error.message, code: error.code }; throw error; }
   });
   handle('remarkable-await-drop', async (input) => {
@@ -413,6 +427,9 @@ function registerEngelbartIpc({ ipcMain, trustedHandler, store, openExternal, re
     return sender().awaitDrop({ name: str(input.name, 'name', 512), since, file: typeof input.file === 'string' ? input.file : null });
   });
   handle('remarkable-cancel-drop', (name) => { sender().cancel(str(name, 'name', 512)); return true; });
+  // What a library row is to reMarkable (remarkable/rows.cjs rowKind): 'tablet' | 'merged' | null. The Stage offers Send
+  // to reMarkable for any pdf but a document of the tablet's.
+  handle('remarkable-row-kind', withCtx((ctx, id) => rowKind(remarkableMirrorDir(ctx.dataRoot), str(id, 'library id', 64))));
   handle('remarkable-help', async (what) => {
     const page = str(what, 'page', 16);
     if (page === 'app') await openExternal(REMARKABLE_APP);

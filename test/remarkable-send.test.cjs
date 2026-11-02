@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createRemarkableSend } = require('../src/main/remarkable/send.cjs');
+const { createRemarkableSend, rowForSend, highlightsOf } = require('../src/main/remarkable/send.cjs');
 
 const PDF = new TextEncoder().encode('%PDF-1.7\n1 0 obj << >> endobj\n%%EOF\n');
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'remarkable-send-'));
@@ -37,7 +37,7 @@ test('the app takes the PDF: sent, under its name, the bytes as they were', asyn
   const app = fakeApp();
   const send = createRemarkableSend({ ...app.deps, dir: tmp(), now: clock() });
   const result = await send.send({ name: 'Attention: is all / you need', bytes: PDF });
-  assert.deepEqual(result, { state: 'sent', name: 'Attention- is all - you need' });
+  assert.deepEqual(result, { state: 'sent', name: 'Attention- is all - you need', highlights: 0 });
   assert.equal(app.opened.length, 1);
   assert.equal(path.basename(app.opened[0].file), 'Attention- is all - you need.pdf');
   assert.deepEqual(new Uint8Array(app.opened[0].bytes), PDF);
@@ -66,7 +66,7 @@ test('a document of the same name already there is not taken for the new one', a
 test('the app\'s library cannot be read: handed over, not confirmed', async () => {
   const app = fakeApp({ readable: false });
   const send = createRemarkableSend({ ...app.deps, dir: tmp(), now: clock() });
-  assert.deepEqual(await send.send({ name: 'Paper', bytes: PDF }), { state: 'given', name: 'Paper' });
+  assert.deepEqual(await send.send({ name: 'Paper', bytes: PDF }), { state: 'given', name: 'Paper', highlights: 0 });
 });
 
 test('not a PDF, or no reMarkable app: said in words, nothing opened', async () => {
@@ -119,4 +119,55 @@ test('the sync is told before the app is given the PDF, from which library row, 
   told.length = 0;
   await send.send({ name: 'Loose', bytes: PDF });
   assert.equal(told[0][2], null, 'a PDF the library does not hold is from no row');
+});
+
+// Highlights made in Engelbart go to the tablet (2026-11-02): drawn into what is sent; the sync is given the PDF as it
+// was before, to draw the tablet's ink on, so they are not shown twice on the item.
+test('highlights go drawn into the PDF sent; the sync keeps the PDF as it was without them', async () => {
+  const app = fakeApp();
+  const told = [];
+  const drawn = new TextEncoder().encode('%PDF-1.7 with highlights');
+  const send = createRemarkableSend({ ...app.deps, dir: tmp(), now: clock(), expect: (name, row, source) => told.push({ row, source }), draw: async (bytes, highlights) => { told.push({ highlights }); return drawn; } });
+  const marks = { 2: [{ id: 'm1', rects: [{ x: 0.1, y: 0.2, w: 0.3, h: 0.02 }], note: 'mine' }, { id: 'n1', pos: { x: 0.5, y: 0.5 }, note: 'a free note' }], web: [{ id: 'w' }] };
+  const result = await send.send({ name: 'Paper', bytes: PDF, from: 'row-1', marks });
+  assert.equal(result.highlights, 1);
+  assert.deepEqual(told[0].highlights, [{ page: 1, rects: [{ x: 0.1, y: 0.2, w: 0.3, h: 0.02 }] }], 'pages from 0; a free note is no highlight');
+  assert.deepEqual(Buffer.from(app.opened[0].bytes), Buffer.from(drawn), 'the app is given the PDF with them drawn in');
+  assert.deepEqual(Buffer.from(told[1].source), Buffer.from(PDF), 'the sync keeps it as it was');
+  assert.equal(told[1].row, 'row-1');
+});
+
+test('no highlights: sent as it was; a drawing that fails sends it without them; no row, no source kept', async () => {
+  const app = fakeApp();
+  const told = [];
+  const send = createRemarkableSend({ ...app.deps, dir: tmp(), now: clock(), expect: (name, row, source) => told.push({ row, source }), draw: async () => { throw new Error('broken'); } });
+  const result = await send.send({ name: 'Paper', bytes: PDF, marks: { 1: [{ id: 'm', rects: [{ x: 0, y: 0, w: 0.1, h: 0.1 }] }] } });
+  assert.equal(result.highlights, 0);
+  assert.deepEqual(Buffer.from(app.opened[0].bytes), Buffer.from(PDF));
+  assert.deepEqual(told, [{ row: null, source: null }]);
+});
+
+test('highlightsOf: only pages, only marks with rectangles', () => {
+  assert.deepEqual(highlightsOf(null), []);
+  assert.deepEqual(highlightsOf({ 0: [{ rects: [{ x: 0, y: 0, w: 1, h: 1 }] }], x: [], 3: [{ rects: [{ x: 0, y: 0, w: 0, h: 1 }, { x: 0.1, y: 0.1, w: 0.2, h: 0.1 }] }] }), [{ page: 2, rects: [{ x: 0.1, y: 0.1, w: 0.2, h: 0.1 }] }]);
+});
+
+test('rowForSend: the row given; else the one the library has for it; else saved now; else none', async () => {
+  const rows = new Map([['r1', { id: 'r1', type: 'pdf', path: '/home/me/a.pdf' }], ['r2', { id: 'r2', type: 'pdf', path: '/home/me/b.pdf' }]]);
+  const ctx = { libraryDb: { get: async (id) => rows.get(id) || null } };
+  const calls = [];
+  const library = {
+    lookupItem: async (c, input) => ({ row: input === '/home/me/b.pdf' ? rows.get('r2') : null }),
+    addPdfCopy: async (c, input, bytes, { name }) => { calls.push(['copy', input, name]); return { id: 'new-web', type: 'pdf' }; },
+    addItem: async (c, input, { name }) => { calls.push(['item', input, name]); if (input.includes('outside')) throw new Error('outside'); return { id: 'new-file', type: 'pdf' }; },
+  };
+  const ask = (at) => rowForSend(ctx, { bytes: PDF, name: 'Paper', ...at }, { library });
+  assert.deepEqual(await ask({ rowId: 'r1' }), { row: rows.get('r1'), saved: false });
+  assert.deepEqual(await ask({ input: '/home/me/b.pdf' }), { row: rows.get('r2'), saved: false }, 'already in the library');
+  assert.deepEqual(await ask({ input: 'https://example.org/p.pdf' }), { row: { id: 'new-web', type: 'pdf' }, saved: true }, 'from the web: kept as a copy');
+  assert.deepEqual(await ask({ input: '/home/me/c.pdf' }), { row: { id: 'new-file', type: 'pdf' }, saved: true }, 'on disk: the file itself');
+  assert.deepEqual(await ask({ input: '/outside/d.pdf' }), { row: null, saved: false }, 'one the library cannot keep');
+  assert.deepEqual(await ask({}), { row: null, saved: false });
+  assert.deepEqual(calls.map((c) => c.slice(0, 2)), [['copy', 'https://example.org/p.pdf'], ['item', '/home/me/c.pdf'], ['item', '/outside/d.pdf']]);
+  assert.equal(calls[0][2], 'Paper', 'named as the Stage shows it');
 });

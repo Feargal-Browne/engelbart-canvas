@@ -18,8 +18,11 @@
 // the one item shows the tablet's ink and handwriting under the highlights and notes made in Engelbart, which stay
 // with the row as they are kept by its id and page numbers. rows.json keeps the row's own file (`original`); the row
 // goes back to it when the copy has no ink, goes from the tablet, or reMarkable is disconnected. Its name is the
-// row's own throughout. Not for a row that holds no file, or one another copy's ink is on already: such a copy gets a
-// row of its own, as any document.
+// row's own throughout. More copies sent from one row are one item: their ink is drawn into the first's PDF
+// (./sync.cjs), and they have no row. Not for a row that holds no file: such a copy gets a row of its own, as any
+// document.
+// `refreshed(ids)`: the rows whose file changed (another file, or the same one written again), so a Stage tab showing
+// one takes it again.
 
 const fs = require('node:fs');
 const path = require('node:path');
@@ -61,9 +64,9 @@ async function restoreRow(ctx, library, row, original) {
 
 /**
  * Brings the library's rows up to the mirror at `root` (mirrorDir(<dataRoot>)). `ctx`: the store's context (its
- * libraryDb). → { added, changed, removed }, counts.
+ * libraryDb). `refreshed(ids)`: told the rows whose file changed, when any did. → { added, changed, removed }, counts.
  */
-async function reconcileRows(ctx, root) {
+async function reconcileRows(ctx, root, { refreshed = null } = {}) {
   const state = readJson(path.join(root, 'state.json'));
   // No mirror to follow (disconnected, or its state unreadable this moment): the rows are left as they are. Taking
   // them away is disconnecting's alone (removeRows).
@@ -91,15 +94,19 @@ async function reconcileRows(ctx, root) {
   // file never takes one of those (a rename and a new document of the old name in one sync).
   const claimed = new Set(Object.entries(map).filter(([docId, was]) => was && items[docId] && rows.has(was.row)).map(([, was]) => was.row));
   const holders = new Map(); // a row → the sent copy whose ink is on it (one each)
-  for (const [docId, was] of Object.entries(map)) if (was && was.original && items[docId] && !holders.has(was.row)) holders.set(was.row, docId);
+  for (const [docId, was] of Object.entries(map)) if (was && was.original && items[docId] && !items[docId].joined && !holders.has(was.row)) holders.set(was.row, docId);
+  const originals = new Map(); // a row → its own file, as a sent copy's record kept it
+  for (const was of Object.values(map)) if (was && was.original && !originals.has(was.row)) originals.set(was.row, was.original);
+  const files = new Set(); // rows whose file changed
+  const fresh = (was, item) => was && was.version !== undefined && was.version !== item.version;
   for (const [docId, item] of Object.entries(items)) {
-    if (item.kind !== 'document') continue;
+    if (item.kind !== 'document' || item.joined) continue; // a later copy of a row's: in the first's PDF
     const rel = fileOf(item);
     let was = map[docId];
     // A copy sent from Engelbart: onto the row it was sent from.
     if (item.sent && typeof item.from === 'string') {
       const origin = rows.get(item.from);
-      const original = origin && (inMirror(library, origin.path) ? (was && was.original) || null : origin.path);
+      const original = origin && (inMirror(library, origin.path) ? (was && was.original) || originals.get(origin.id) || null : origin.path);
       const already = !!(was && was.original && was.row === item.from); // its ink is on that row already
       const free = origin && (holders.get(origin.id) || docId) === docId && (already || !claimed.has(origin.id));
       if (origin && origin.type === 'pdf' && original && free) {
@@ -110,14 +117,15 @@ async function reconcileRows(ctx, root) {
           if (file !== original) await keepInk(ctx, origin);
           rows.set(origin.id, (await ctx.libraryDb.updatePath(origin.id, file)) || { ...origin, path: file });
           out.changed += 1;
-        }
-        next[docId] = { row: origin.id, name: origin.name, file: file === original ? null : file, original };
+          files.add(origin.id);
+        } else if (file !== original && fresh(was, item)) files.add(origin.id);
+        next[docId] = { row: origin.id, name: origin.name, file: file === original ? null : file, original, version: item.version };
         continue;
       }
       // The row is gone (removed in Engelbart), holds no file, or has another copy's ink: a row of its own.
       if (was && was.original) {
-        const back = await restoreRow(ctx, library, origin, was.original);
-        if (back) { rows.set(back.id, back); out.changed += 1; }
+        const back = origin && (holders.get(origin.id) || docId) === docId ? await restoreRow(ctx, library, origin, was.original) : null;
+        if (back) { rows.set(back.id, back); out.changed += 1; files.add(back.id); }
         was = undefined;
       }
     }
@@ -144,22 +152,24 @@ async function reconcileRows(ctx, root) {
       out.added += 1;
     } else {
       if ((!was || was.name !== name) && row.name !== name) { row = (await ctx.libraryDb.rename(row.id, name)) || { ...row, name }; out.changed += 1; }
-      if (row.path !== file) { row = (await ctx.libraryDb.updatePath(row.id, file)) || { ...row, path: file }; out.changed += 1; }
+      if (row.path !== file) { row = (await ctx.libraryDb.updatePath(row.id, file)) || { ...row, path: file }; out.changed += 1; files.add(row.id); }
+      else if (fresh(was, item)) files.add(row.id);
       rows.set(row.id, row);
     }
-    next[docId] = { row: row.id, name, file };
+    next[docId] = { row: row.id, name, file, version: item.version };
   }
   // Documents gone from the tablet: their rows go too; a row a sent copy's ink was on stays, with its own file again.
   for (const [docId, was] of Object.entries(map)) {
     if (next[docId] || !was || !rows.has(was.row)) continue;
     if (was.original) {
-      if (!holders.has(was.row) && await restoreRow(ctx, library, rows.get(was.row), was.original)) out.changed += 1;
+      if (!holders.has(was.row) && await restoreRow(ctx, library, rows.get(was.row), was.original)) { out.changed += 1; files.add(was.row); }
       continue;
     }
     await ctx.libraryDb.remove(was.row);
     out.removed += 1;
   }
   writeJson(mapFile, next);
+  if (files.size && typeof refreshed === 'function') { try { refreshed([...files]); } catch { /* a listener never breaks a sync */ } }
   return out;
 }
 
@@ -182,4 +192,19 @@ async function removeRows(ctx, root) {
   return removed;
 }
 
-module.exports = { reconcileRows, removeRows };
+/**
+ * What library row `rowId` is to reMarkable (rows.json at `root`): 'tablet', a document of the tablet's; 'merged', a row
+ * a sent copy's ink comes onto; null, neither.
+ */
+function rowKind(root, rowId) {
+  const map = readJson(path.join(root, 'rows.json')) || {};
+  let kind = null;
+  for (const was of Object.values(map)) {
+    if (!was || was.row !== rowId) continue;
+    if (!was.original) return 'tablet';
+    kind = 'merged';
+  }
+  return kind;
+}
+
+module.exports = { reconcileRows, removeRows, rowKind };

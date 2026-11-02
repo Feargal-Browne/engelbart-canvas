@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { PDFArray, PDFDocument, StandardFonts } from 'pdf-lib';
+import { degrees, PDFArray, PDFDocument, StandardFonts } from 'pdf-lib';
 import { openBundle } from '../src/doc/bundle.ts';
 import { readDocument } from '../src/document.ts';
 import { documentToPdf } from '../src/export/pdf.ts';
+import { drawHighlights, shownToPdf } from '../src/export/marks.ts';
 import { UNITS_PER_POINT } from '../src/geometry.ts';
 import { createFolderSource } from '../src/sources/folder.ts';
 
@@ -94,4 +95,30 @@ test('a PDF that cannot be opened still gives the ink, on blank pages', async ()
   const bundle = await bundleOf(new TextEncoder().encode('%PDF-1.7 broken'), [{ id: P[0], idx: lww('ba'), redir: lww(0) }], [P[0]!]);
   const pdf = await PDFDocument.load(await documentToPdf(await readDocument(bundle), { source: await bundle.source() }));
   assert.equal(pdf.getPageCount(), 1);
+});
+
+// Highlights made in Engelbart drawn onto a PDF sent to the tablet (export/marks.ts).
+test('drawHighlights: drawn on the pages they are for, in the page as shown; nothing to draw gives the bytes back', async () => {
+  const source = await pdfOf([[600, 800], [500, 700]]);
+  assert.equal(await drawHighlights(source, []), source);
+  assert.equal(await drawHighlights(source, [{ page: 5, rects: [{ x: 0.1, y: 0.1, w: 0.2, h: 0.02 }] }]), source);
+  const out = await PDFDocument.load(await drawHighlights(source, [{ page: 1, rects: [{ x: 0.1, y: 0.1, w: 0.2, h: 0.02 }] }]));
+  const plain = await PDFDocument.load(source);
+  const streams = (d: PDFDocument, i: number) => { const c = d.getPage(i).node.Contents(); return c instanceof PDFArray ? c.size() : c ? 1 : 0; };
+  assert.equal(streams(out, 0), streams(plain, 0), 'page 1 untouched');
+  assert.ok(streams(out, 1) > streams(plain, 1), 'page 2 drawn on');
+});
+
+test('shownToPdf: the top-left of the page as shown, whatever its /Rotate', async () => {
+  const pdf = await PDFDocument.create();
+  const corner = (rotate: number) => {
+    const page = pdf.addPage([600, 800]);
+    page.setRotation(degrees(rotate));
+    const to = shownToPdf(page);
+    return [to(0, 0), to(1, 0)];
+  };
+  assert.deepEqual(corner(0), [[0, 800], [600, 800]], 'upright: the top edge, left to right');
+  assert.deepEqual(corner(90), [[0, 0], [0, 800]], 'a quarter turn clockwise: the left edge, bottom to top');
+  assert.deepEqual(corner(180), [[600, 0], [0, 0]]);
+  assert.deepEqual(corner(270), [[600, 800], [600, 0]]);
 });

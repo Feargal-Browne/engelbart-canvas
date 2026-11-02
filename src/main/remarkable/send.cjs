@@ -11,9 +11,15 @@
 // anywhere: the reMarkable app does the importing.
 //
 // What the app makes of it is a document of its own, which Connect would bring back into the library beside the PDF it
-// came from: `expect(name, row)` (before the app is given it; `row` the library row it is sent from) and
-// `arrived(entry)` tell ./sync.cjs, which leaves that copy out of the library for as long as nobody has written on it,
-// and then puts its ink on that row (./rows.cjs).
+// came from: `expect(name, row, source)` (before the app is given it; `row` the library row it is sent from, `source`
+// the PDF as it was before Engelbart's highlights were drawn in) and `arrived(entry)` tell ./sync.cjs, which leaves
+// that copy out of the library for as long as nobody has written on it, and then puts its ink on that row
+// (./rows.cjs), drawn on `source` so Engelbart's highlights are not shown twice there.
+//
+// The highlights made in Engelbart go to the tablet with it, drawn into its pages (bridge drawHighlights): the
+// reMarkable app shows a PDF's pages, not annotations kept beside it. They are as they were when it was sent; sending
+// it again takes the ones made since. rowForSend: the library row a PDF is sent from, saved to the library first when
+// it is not there, so the tablet's ink has an item to come back to.
 
 const fs = require('node:fs');
 const os = require('node:os');
@@ -34,6 +40,48 @@ class SendError extends Error {
 }
 
 const isPdf = (bytes) => bytes && bytes.length > 5 && Buffer.from(bytes.subarray(0, Math.min(1024, bytes.length))).includes('%PDF-');
+
+/**
+ * A PDF's ink as Engelbart keeps it ({ "<page>": [mark] }, pages from 1, a highlight's `rects` fractions of the page's
+ * shown width: src/renderer/pdf/marks.js) → the bridge's highlights ([{ page (from 0), rects }]). A free note (no
+ * rects) and anything else that is not a page are left out.
+ */
+function highlightsOf(marks) {
+  const out = [];
+  if (!marks || typeof marks !== 'object' || Array.isArray(marks)) return out;
+  for (const [key, list] of Object.entries(marks)) {
+    const page = Number(key);
+    if (!Number.isInteger(page) || page < 1 || !Array.isArray(list)) continue;
+    for (const mark of list) {
+      const rects = mark && Array.isArray(mark.rects) ? mark.rects.filter((r) => r && [r.x, r.y, r.w, r.h].every(Number.isFinite) && r.w > 0 && r.h > 0) : [];
+      if (rects.length) out.push({ page: page - 1, rects: rects.map(({ x, y, w, h }) => ({ x, y, w, h })) });
+    }
+  }
+  return out;
+}
+
+const drawWithBridge = (bytes, highlights) => require('remarkable-bridge').drawHighlights(bytes, highlights);
+
+/**
+ * The library row a PDF is sent from (`library`: store/library.cjs): `rowId`'s; else the one its address or path is
+ * already; else it is saved to the library now, as the Stage's Save keeps it (a copy, for one from the web; the file
+ * itself, for one on disk), so what is written on it on the tablet has an item to come back to. → { row, saved }; row
+ * null when it cannot be kept (then its copy comes back as an item of its own).
+ */
+async function rowForSend(ctx, { rowId = null, input = null, bytes, name = null }, { library, inspectPdf = null }) {
+  if (rowId) { const row = await ctx.libraryDb.get(rowId); if (row) return { row, saved: false }; }
+  const address = typeof input === 'string' ? input.trim() : '';
+  if (!address || /^(about|data|blob):/i.test(address)) return { row: null, saved: false };
+  try { const { row } = await library.lookupItem(ctx, address); if (row) return { row, saved: false }; } catch { /* not one it can tell */ }
+  try {
+    const row = /^https?:\/\//i.test(address)
+      ? await library.addPdfCopy(ctx, address, bytes, { inspectPdf, name })
+      : await library.addItem(ctx, address, { inspectPdf, name });
+    return { row, saved: true };
+  } catch {
+    return { row: null, saved: false };
+  }
+}
 
 /** Where the reMarkable app is: Spotlight by its bundle id, else /Applications. null when it is not on this Mac. */
 function findApp() {
@@ -56,10 +104,10 @@ const openWith = (app, file) => new Promise((resolve, reject) => {
 
 /**
  * `list()`: the reMarkable app's library (the bridge's desktop source list). `findApp()`, `open(app, file)`: injected by
- * the tests. `dir`: where copies to send are kept. `expect(name, row)`, `arrived(entry)`: ./sync.cjs's. → { send,
- * awaitDrop, cancel, owns, dir }
+ * the tests. `dir`: where copies to send are kept. `expect(name, row, source)`, `arrived(entry)`: ./sync.cjs's.
+ * `draw(bytes, highlights)`: highlights drawn into a PDF (bridge drawHighlights). → { send, awaitDrop, cancel, owns, dir }
  */
-function createRemarkableSend({ list, findApp: locate = findApp, open = openWith, expect = () => {}, arrived = () => {}, dir = path.join(os.tmpdir(), 'engelbart-to-remarkable'), waitMs = WAIT_MS, dropWaitMs = DROP_WAIT_MS, pollMs = POLL_MS, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = () => Date.now() } = {}) {
+function createRemarkableSend({ list, findApp: locate = findApp, open = openWith, expect = () => {}, arrived = () => {}, draw = drawWithBridge, dir = path.join(os.tmpdir(), 'engelbart-to-remarkable'), waitMs = WAIT_MS, dropWaitMs = DROP_WAIT_MS, pollMs = POLL_MS, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), now = () => Date.now() } = {}) {
   /** The ids of every document in the app's library now; null when it cannot be read (then nothing can be confirmed). */
   async function snapshot() {
     try { return new Set((await list()).map((entry) => entry.id)); } catch { return null; }
@@ -102,31 +150,47 @@ function createRemarkableSend({ list, findApp: locate = findApp, open = openWith
   }
 
   /**
-   * Puts the PDF `bytes` on the tablet as `name`; `from`: the library row it is, or null. → { state: 'sent', name } once
-   * the app has it; { state: 'drop', name, file } when it did not take it by itself (the window offers `file` to drag
-   * into it); { state: 'given', name } when the app's library cannot be read to tell. Throws SendError (code 'no-app',
-   * 'not-pdf', 'too-big').
+   * Puts the PDF `bytes` on the tablet as `name`, with the highlights in `marks` (Engelbart's ink for it) drawn in;
+   * `from`: the library row it is, or null. → { state: 'sent', name, highlights } once the app has it; { state: 'drop',
+   * name, file, highlights } when it did not take it by itself (the window offers `file` to drag into it); { state:
+   * 'given', name, highlights } when the app's library cannot be read to tell. `highlights`: how many went with it.
+   * Throws SendError (code 'no-app', 'not-pdf', 'too-big').
    */
-  async function send({ name, bytes, from = null }) {
-    const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
-    if (!isPdf(data)) throw new SendError('Only PDFs can be sent to reMarkable for now.', 'not-pdf');
-    if (data.length > MAX_BYTES) throw new SendError('This PDF is larger than reMarkable takes (200 MB).', 'too-big');
-    const app = await locate();
-    if (!app) throw new SendError('The reMarkable app isn’t on this Mac. Install it from downloads.remarkable.com and sign in, then send again.', 'no-app');
+  async function send({ name, bytes, from = null, marks = null }) {
+    const { data, app } = await check(bytes);
+    const highlights = highlightsOf(marks);
+    let drawn = data;
+    if (highlights.length) { try { drawn = await draw(data, highlights); } catch { drawn = data; /* it goes without them */ } }
+    const shown = drawn === data ? 0 : highlights.length;
+    if (drawn.length > MAX_BYTES) throw new SendError('This PDF is larger than reMarkable takes (200 MB).', 'too-big');
     prune();
     // A name with nothing to keep (only dots or spaces) would be "Untitled", and could be taken for another document.
     const title = /[\p{L}\p{N}]/u.test(String(name || '')) ? safeName(name) : `From Engelbart ${new Date(now()).toISOString().slice(0, 16).replace('T', ' ').replace(':', '.')}`;
     const own = path.join(dir, randomUUID());
     fs.mkdirSync(own, { recursive: true });
     const file = path.join(own, `${title}.pdf`);
-    fs.writeFileSync(file, data);
+    fs.writeFileSync(file, drawn);
     const before = await snapshot();
-    try { expect(title, typeof from === 'string' && from ? from : null); } catch { /* the copy comes into the library as a document of its own */ }
+    const row = typeof from === 'string' && from ? from : null;
+    try { expect(title, row, row ? data : null); } catch { /* the copy comes into the library as a document of its own */ }
     await open(app, file);
-    if (!before) return { state: 'given', name: title };
+    if (!before) return { state: 'given', name: title, highlights: shown };
     const came = await arrival(title, before, waitMs);
-    if (came) { forget(file); return { state: 'sent', name: title }; }
-    return { state: 'drop', name: title, file, since: [...before] };
+    if (came) { forget(file); return { state: 'sent', name: title, highlights: shown }; }
+    return { state: 'drop', name: title, file, since: [...before], highlights: shown };
+  }
+
+  /**
+   * Whether `bytes` can be sent (before anything is saved for it): a PDF reMarkable takes, and the reMarkable app here.
+   * → { data, app }. Throws SendError (code 'not-pdf', 'too-big', 'no-app').
+   */
+  async function check(bytes) {
+    const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    if (!isPdf(data)) throw new SendError('Only PDFs can be sent to reMarkable for now.', 'not-pdf');
+    if (data.length > MAX_BYTES) throw new SendError('This PDF is larger than reMarkable takes (200 MB).', 'too-big');
+    const app = await locate();
+    if (!app) throw new SendError('The reMarkable app isn’t on this Mac. Install it from downloads.remarkable.com and sign in, then send again.', 'no-app');
+    return { data, app };
   }
 
   /**
@@ -148,7 +212,7 @@ function createRemarkableSend({ list, findApp: locate = findApp, open = openWith
     return resolved.startsWith(path.resolve(dir) + path.sep) && resolved.endsWith('.pdf') && fs.existsSync(resolved);
   };
 
-  return { send, awaitDrop, cancel, owns, dir };
+  return { send, check, awaitDrop, cancel, owns, dir };
 }
 
-module.exports = { createRemarkableSend, findApp, SendError, WAIT_MS, DROP_WAIT_MS };
+module.exports = { createRemarkableSend, rowForSend, highlightsOf, findApp, SendError, WAIT_MS, DROP_WAIT_MS };

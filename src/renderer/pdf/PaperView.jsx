@@ -472,6 +472,10 @@ export default class PaperView extends React.Component {
       if (text) this.applyTarget(text);
     }
     if (prev.bytes !== this.props.bytes) {
+      // The same paper with its file written again (the Stage's refresh: the tablet's ink came onto it): read on from
+      // where it was, at the same zoom.
+      const host = this.host.current;
+      this.keepView = prev.bytes && this.doc && host && host.scrollHeight ? { zoom: this.zoom, at: host.scrollTop / host.scrollHeight, left: host.scrollLeft } : null;
       this.flushSave(prev.onMarksChange);
       this.marks = clone(this.props.marks || {});
       this.dirty = false;
@@ -589,7 +593,8 @@ export default class PaperView extends React.Component {
       if (gen !== this.gen) { destroyDoc(doc); return; }
       this.doc = doc;
       this.setState({ note: '' });
-      const view = this.props.target || this.props.initialSection ? null : this.props.view;
+      const view = this.keepView || (this.props.target || this.props.initialSection ? null : this.props.view);
+      this.keepView = null;
       if (view && view.zoom > 0) this.zoom = view.zoom;
       await this.layout(null);
       const h = this.host.current;
